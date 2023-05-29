@@ -1,13 +1,20 @@
 use std::fs::File;
 use std::io::{Error, Write};
+use linux_embedded_hal::{Spidev, Pin};
+use spidev::{SpidevOptions, SpidevTransfer};
+use rust_gpiozero::OutputDevice;
 
-pub struct EvsePiHat {
+pub struct ADC {
+    spi: Spidev,
+}
+
+pub struct Pilot {
     period_file: File,
     duty_cycle_file: File,
     enable_file: File,
 }
 
-impl EvsePiHat {
+impl Pilot {
     pub fn new() -> Result<Self, Error> {
         let period_file = File::create("/sys/class/pwm/pwmchip0/pwm0/period")?;
         let duty_cycle_file = File::create("/sys/class/pwm/pwmchip0/pwm0/duty_cycle")?;
@@ -53,7 +60,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let evse = EvsePiHat::new().unwrap();
+        let evse = Pilot::new().unwrap();
         assert!(evse.period_file.metadata().unwrap().len() > 0);
         assert!(evse.duty_cycle_file.metadata().unwrap().len() > 0);
         assert!(evse.enable_file.metadata().unwrap().len() > 0);
@@ -61,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_activate_pilot() {
-        let mut evse = EvsePiHat::new().unwrap();
+        let mut evse = Pilot::new().unwrap();
         evse.activate_pilot().unwrap();
         let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
         assert_eq!(duty_cycle.trim(), "100000");
@@ -71,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_set_duty_cycle() {
-        let mut evse = EvsePiHat::new().unwrap();
+        let mut evse = Pilot::new().unwrap();
         evse.set_duty_cycle(10.0).unwrap();
         let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
         assert_eq!(duty_cycle.trim(), "1000000");
@@ -79,7 +86,7 @@ mod tests {
 
     #[test]
     fn test_override_output() {
-        let mut evse = EvsePiHat::new().unwrap();
+        let mut evse = Pilot::new().unwrap();
         evse.override_output(true).unwrap();
         let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
         assert_eq!(duty_cycle.trim(), "1010000");
