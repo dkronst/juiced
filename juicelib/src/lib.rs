@@ -1,54 +1,44 @@
+use std::time::Duration;
 use std::fs::File;
 use std::io::{Error, Write};
 use linux_embedded_hal::{Spidev, Pin};
 use spidev::{SpidevOptions, SpidevTransfer};
 use rust_gpiozero::OutputDevice;
-
-pub struct ADC {
-    spi: Spidev,
-}
+use rppal::pwm::{Pwm, Error as PwmError, Channel};
 
 pub struct Pilot {
-    period_file: File,
-    duty_cycle_file: File,
-    enable_file: File,
+    pwm: Pwm,
 }
 
 impl Pilot {
-    pub fn new() -> Result<Self, Error> {
-        let period_file = File::create("/sys/class/pwm/pwmchip0/pwm0/period")?;
-        let duty_cycle_file = File::create("/sys/class/pwm/pwmchip0/pwm0/duty_cycle")?;
-        let enable_file = File::create("/sys/class/pwm/pwmchip0/pwm0/enable")?;
+    pub fn new() -> Result<Self, PwmError> {
+        let pwm = Pwm::new(Channel::Pwm0)?;
+        pwm.set_period(Duration::from_millis(1))?;
+        pwm.enable()?;
 
         Ok(Self {
-            period_file,
-            duty_cycle_file,
-            enable_file,
+            pwm,
         })
     }
 
-    pub fn activate_pilot(&mut self) -> Result<(), Error> {
-        self.period_file.write_all(b"1000000\n")?;
-        self.duty_cycle_file.write_all(b"100000\n")?;
-        self.enable_file.write_all(b"1\n")?;
+    pub fn set_to_waiting_for_vehicle(&mut self) -> Result<(), PwmError> {
+        // Setting the dc to 1.01 will cause the pilot to go to +12V constant
+        // which is the waiting for vehicle state.
+        self.pwm.set_duty_cycle(1.01 as f64)?;
 
         Ok(())
     }
 
-    pub fn set_duty_cycle(&mut self, duty_cycle: f32) -> Result<(), Error> {
-        let duty_cycle_ns = (duty_cycle * 10000.0) as u32;
-        self.duty_cycle_file.write_all(format!("{}\n", duty_cycle_ns).as_bytes())?;
+    pub fn set_duty_cycle(&mut self, duty_cycle: f64) -> Result<(), PwmError> {
+        self.pwm.set_duty_cycle(duty_cycle)?;
 
         Ok(())
     }
 
-    pub fn override_output(&mut self, override_output: bool) -> Result<(), Error> {
-        let duty_cycle_ns = if override_output {
-            1010000
-        } else {
-            100000
-        };
-        self.duty_cycle_file.write_all(format!("{}\n", duty_cycle_ns).as_bytes())?;
+    pub fn set_to_error(&mut self) -> Result<(), PwmError> {
+        // Setting the dc to 0 will cause the pilot to go to -12V which is
+        // the error state.
+        self.pwm.set_duty_cycle(0 as f64)?;
 
         Ok(())
     }
@@ -59,39 +49,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new() {
-        let evse = Pilot::new().unwrap();
-        assert!(evse.period_file.metadata().unwrap().len() > 0);
-        assert!(evse.duty_cycle_file.metadata().unwrap().len() > 0);
-        assert!(evse.enable_file.metadata().unwrap().len() > 0);
+    fn test_set_to_waiting_for_vehicle() -> Result<(), PwmError> {
+        let mut pilot = Pilot::new();
+        pilot.set_to_waiting_for_vehicle()?;
+        assert_eq!(pilot.pwm.get_duty_cycle(), 1.01);
+        Ok(())
     }
 
     #[test]
-    fn test_activate_pilot() {
-        let mut evse = Pilot::new().unwrap();
-        evse.activate_pilot().unwrap();
-        let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
-        assert_eq!(duty_cycle.trim(), "100000");
-        let enable = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/enable").unwrap();
-        assert_eq!(enable.trim(), "1");
+    fn test_set_duty_cycle() -> Result<(), PwmError> {
+        let mut pilot = Pilot::new();
+        pilot.set_duty_cycle(0.5)?;
+        assert_eq!(pilot.pwm.get_duty_cycle(), 0.5);
+        Ok(())
     }
 
     #[test]
-    fn test_set_duty_cycle() {
-        let mut evse = Pilot::new().unwrap();
-        evse.set_duty_cycle(10.0).unwrap();
-        let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
-        assert_eq!(duty_cycle.trim(), "1000000");
-    }
-
-    #[test]
-    fn test_override_output() {
-        let mut evse = Pilot::new().unwrap();
-        evse.override_output(true).unwrap();
-        let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
-        assert_eq!(duty_cycle.trim(), "1010000");
-        evse.override_output(false).unwrap();
-        let duty_cycle = std::fs::read_to_string("/sys/class/pwm/pwmchip0/pwm0/duty_cycle").unwrap();
-        assert_eq!(duty_cycle.trim(), "100000");
+    fn test_set_to_error() -> Result<(), PwmError> {
+        let mut pilot = Pilot::new();
+        pilot.set_to_error()?;
+        assert_eq!(pilot.pwm.get_duty_cycle(), 0.0);
+        Ok(())
     }
 }
