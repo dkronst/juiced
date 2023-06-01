@@ -85,6 +85,7 @@ name = "juicelib"
 version = "0.1.0"
 dependencies = [
  "linux-embedded-hal",
+ "mcp3xxx",
  "rppal 0.14.1",
  "rust_gpiozero",
  "spidev",
@@ -118,6 +119,15 @@ dependencies = [
  "spidev",
  "sysfs_gpio",
  "void",
+]
+
+[[package]]
+name = "mcp3xxx"
+version = "0.1.0-pre.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae4b579d8048dfb12ed62a120f4a7dbc8277d9406fdfc9494f76d1a024c28a9d"
+dependencies = [
+ "rppal 0.11.3",
 ]
 
 [[package]]
@@ -155,6 +165,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "rppal"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "137dbba1fb867daa27cda4c3cd6a11bca5bb5a1551f034cf9319b994846ddbe1"
+dependencies = [
+ "lazy_static",
+ "libc",
 ]
 
 [[package]]
