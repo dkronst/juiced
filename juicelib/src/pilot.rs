@@ -1,8 +1,4 @@
 use std::time::Duration;
-use std::io::{Error, Write};
-use linux_embedded_hal::{Spidev, Pin};
-use spidev::{SpidevOptions, SpidevTransfer};
-use rust_gpiozero::OutputDevice;
 use rppal::pwm::{Pwm, Error as PwmError, Channel};
 
 pub struct Pilot {
