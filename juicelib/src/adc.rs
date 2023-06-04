@@ -1,4 +1,4 @@
-use crate::mcp::lib::{Channel, Mcp3004};
+use crate::mcp::lib::{Channel, Mcp3004, Error as LibError};
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 
 // This file defines a private (to this crate) struct called Adc. It has a
@@ -20,12 +20,19 @@ pub struct Adc {
 #[derive(Debug)]
 pub enum AdcError {
     SpiError(std::io::Error),
+    LibError(LibError),
 }
 
 // Implement From for the standard error type
 impl From<std::io::Error> for AdcError {
     fn from(error: std::io::Error) -> Self {
         Self::SpiError(error)
+    }
+}
+
+impl From<LibError> for AdcError {
+    fn from(error: LibError) -> Self {
+        AdcError::LibError(error)
     }
 }
 
@@ -60,8 +67,43 @@ impl Adc {
 
     pub fn read_current_sense(&mut self) -> Result<f32, AdcError> {
         let reading = self.mcp.single_ended_read(Channel(1))?;
-        let voltage = Self::to_amps(reading.value());
-        Ok(voltage)
+        let curr = Self::to_amps(reading.value());
+        Ok(curr)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_volts() {
+        let reading = 512;
+        let volts = Adc::to_volts(reading);
+        assert_eq!(volts, 1.65);
+    }
+
+    #[test]
+    fn test_to_amps() {
+        let reading = 512;
+        let amps = Adc::to_amps(reading);
+        assert_eq!(amps, 0.0);
+    }
+
+    #[test]
+    fn test_read_pilot_voltage() -> Result<(), AdcError> {
+        let mut adc = Adc::new()?;
+        let voltage = adc.read_pilot_voltage()?;
+        assert!(voltage >= 0.0 && voltage <= 3.3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_current_sense() -> Result<(), AdcError> {
+        let mut adc = Adc::new()?;
+        let current = adc.read_current_sense()?;
+        assert!(current >= -50.0 && current <= 50.0);
+        Ok(())
+    }
 }
