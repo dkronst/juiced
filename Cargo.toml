@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "juicelib",
+    "juiced",
+    "mcp3xxx-eh",
+]

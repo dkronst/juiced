@@ -1,4 +1,3 @@
-use crate::mcp::lib::{Channel, Mcp3004, Error as LibError};
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi};
 
 // This file defines a private (to this crate) struct called Adc. It has a
@@ -23,19 +22,11 @@ pub enum AdcError {
     LibError(LibError),
 }
 
-// Implement From for the standard error type
-impl From<std::io::Error> for AdcError {
-    fn from(error: std::io::Error) -> Self {
-        Self::SpiError(error)
-    }
-}
-
 impl From<LibError> for AdcError {
     fn from(error: LibError) -> Self {
         AdcError::LibError(error)
     }
 }
-
 
 // Implement the Adc struct:
 impl Adc {
