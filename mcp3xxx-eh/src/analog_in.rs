@@ -5,7 +5,7 @@ use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::blocking::spi::Write;
 
 pub struct AnalogIn<'a, SPI, CS> {
-    mcp: &'a dyn MCP3xxx<SPI, CS>,
+    mcp: &'a mut dyn MCP3xxx<SPI, CS>,
     pin_setting: u8,
     is_differential: bool,
 }
@@ -15,7 +15,7 @@ where
     SPI: Write<u8>,
     CS: OutputPin,
 {
-    pub fn new(mcp: &dyn MCP3xxx<SPI, CS>, positive_pin: u8, negative_pin: Option<u8>) -> Self {
+    pub fn new(mcp: &'a mut dyn MCP3xxx<SPI, CS>, positive_pin: u8, negative_pin: Option<u8>) -> Self {
         let is_differential = negative_pin.is_some();
 
         if is_differential {
@@ -26,15 +26,13 @@ where
             match negative_pin {
                 Some(np) => {
                     let x = mcp.diff_pins();
-                    x.get(&(positive_pin, np))
+                    x.get(&(positive_pin, np)).unwrap().clone()
                 }
                 None => panic!("Invalid differential pin mapping"),
             }
         } else {
-            Some(&positive_pin)
+            positive_pin
         };
-        // unwrap() is safe here because we know that the pin setting is valid
-        let pin_setting = *pin_setting.unwrap();
         AnalogIn { mcp, pin_setting, is_differential }
     }
 
