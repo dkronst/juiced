@@ -1,30 +1,40 @@
 // Next, we'll define "analog_in.rs"
 
-use super::mcp3xxx::{MCP3xxx, SPIDevice};
-use embedded_hal::spi::FullDuplex;
+use super::mcp3xxx::{MCP3xxx};
 use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::blocking::spi::Write;
 
-pub struct AnalogIn<SPI, CS> {
-    mcp: SPIDevice<SPI, CS>,
+pub struct AnalogIn<'a, SPI, CS> {
+    mcp: &'a dyn MCP3xxx<SPI, CS>,
     pin_setting: u8,
     is_differential: bool,
 }
 
-impl<SPI, CS> AnalogIn<SPI, CS>
+impl<'a, SPI, CS> AnalogIn<'a, SPI, CS>
 where
-    SPI: FullDuplex<u8>,
+    SPI: Write<u8>,
     CS: OutputPin,
 {
-    pub fn new(mcp: SPIDevice<SPI, CS>, positive_pin: u8, negative_pin: Option<u8>) -> Self {
+    pub fn new(mcp: &dyn MCP3xxx<SPI, CS>, positive_pin: u8, negative_pin: Option<u8>) -> Self {
         let is_differential = negative_pin.is_some();
+
+        if is_differential {
+            mcp.diff_pins().contains_key(&(positive_pin, negative_pin.unwrap()));
+        }
+
         let pin_setting = if is_differential {
             match negative_pin {
-                Some(np) => mcp.diff_pins.get(&(positive_pin, np)),
+                Some(np) => {
+                    let x = mcp.diff_pins();
+                    x.get(&(positive_pin, np))
+                }
                 None => panic!("Invalid differential pin mapping"),
             }
         } else {
-            positive_pin
+            Some(&positive_pin)
         };
+        // unwrap() is safe here because we know that the pin setting is valid
+        let pin_setting = *pin_setting.unwrap();
         AnalogIn { mcp, pin_setting, is_differential }
     }
 

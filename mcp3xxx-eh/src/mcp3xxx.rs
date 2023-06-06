@@ -1,13 +1,14 @@
 // We'll start with the "mcp3xxx.rs"
 
-use embedded_hal::spi::{Mode, MODE_0};
 use embedded_hal::digital::v2::OutputPin;
-use embedded_hal::spi::FullDuplex;
 use embedded_hal::blocking::spi::Write;
+use std::collections::HashMap;
 
-pub trait MCP3xxx {
+pub trait MCP3xxx<SPI, CS> {
+    fn new(spi: SPI, cs: CS) -> Self where Self: Sized;
     fn reference_voltage(&self) -> f32;
     fn read(&mut self, pin: u8, is_differential: bool) -> u16;
+    fn diff_pins(&self) -> HashMap<(u8, u8), u8>;
 }
 
 pub struct SPIDevice<SPI, CS> {
@@ -17,7 +18,7 @@ pub struct SPIDevice<SPI, CS> {
 
 impl<SPI, CS> SPIDevice<SPI, CS>
 where
-    SPI: FullDuplex<u8>,
+    SPI: Write<u8>,
     CS: OutputPin,
 {
     pub fn new(spi: SPI, cs: CS) -> Self {
