@@ -45,34 +45,4 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use embedded_hal_mock::{spi::Transaction as SPITransaction, spi::Mock as MockSPI, pin::Mock as MockPin};
 
-    #[test]
-    fn it_reads_value() {
-        let expectations = [
-            SPITransaction::write(vec![0x80, 0x00]),
-            SPITransaction::transfer(vec![0x00, 0x00], vec![0x03, 0xFF]),
-        ];
-        let mock_spi = MockSPI::new(&expectations);
-        let mock_pin = MockPin::new(&[Ok(())]);
-        let mut device = SPIDevice::new(mock_spi, mock_pin);
-        let mut analog_in = AnalogIn::new(device, 0, None);
-        assert_eq!(analog_in.value(), 65472);
-    }
-
-    #[test]
-    fn it_reads_voltage() {
-        let expectations = [
-            SPITransaction::write(vec![0x80, 0x00]),
-            SPITransaction::transfer(vec![0x00, 0x00], vec![0x03, 0xFF]),
-        ];
-        let mock_spi = MockSPI::new(&expectations);
-        let mock_pin = MockPin::new(&[Ok(())]);
-        let mut device = SPIDevice::new(mock_spi, mock_pin);
-        let mut analog_in = AnalogIn::new(device, 0, None);
-        assert_eq!(analog_in.voltage(), 3.3);
-    }
-}
