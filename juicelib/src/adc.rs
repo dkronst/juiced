@@ -132,4 +132,12 @@ mod tests {
         assert!(current >= -50.0 && current <= 50.0);
         Ok(())
     }
+
+    #[test]
+    fn test_ac_voltage() {
+        let mut adc = Adc::new().unwrap();
+        let reading = adc.mcp.single_ended_read(Adc::AC_VOLTAGE_CHANNEL).unwrap();
+        let voltage = Adc::to_volts(reading);
+        println!("AC Voltage: {}", voltage);
+    }
 }
