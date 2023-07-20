@@ -68,4 +68,20 @@ mod tests {
         assert_eq!(pilot.pwm.duty_cycle().unwrap(), 0.0);
         Ok(())
     }
+
+    #[test]
+    fn test_measure_pwm_update() {
+        // tests the time it takes to change the duty cycle
+        let mut pilot = Pilot::new().unwrap();
+        let start = std::time::Instant::now();
+        let mut count = 0;
+        while start.elapsed() < Duration::from_millis(10) {
+            let rand_dc = rand::random::<f64>();
+            pilot.set_duty_cycle(rand_dc).unwrap();
+            count += 1;
+        }
+        println!("count: {}", count);
+        assert!(count > 25);
+        assert!(start.elapsed() < Duration::from_millis(11));
+    }
 }

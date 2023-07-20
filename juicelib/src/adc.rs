@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi, Error as LibError};
 
 // This file defines a private (to this crate) struct called Adc. It has a
@@ -44,12 +46,9 @@ impl Mcp3004 for Spi {
         let mut read_buffer = [0u8; 3];
         let write_buffer = [0b0000_0001, (0b1000_0000 | (channel << 4)) as u8, 0];
 
-        println!("Write buffer: {:?}", write_buffer);
         self.transfer(&mut read_buffer, &write_buffer)?;
 
         let value = ((read_buffer[1] as u16 & 0x03) << 8) | read_buffer[2] as u16;
-
-        println!("Channel: {}, Value: {}", channel, value);
 
         Ok(value)
     }
@@ -81,7 +80,7 @@ impl Adc {
 
     fn to_amps(reading: u16) -> f32 {
         let voltage = (reading as f32) * Self::REFERENCE_VOLTAGE / 1024.0;
-        let amps = (voltage - 1.65) / 0.066;
+        let amps = (voltage - Self::REFERENCE_VOLTAGE/2.) / 0.066;
         amps
     }
 
@@ -97,6 +96,40 @@ impl Adc {
         Ok(curr)
     }
 
+    pub fn peak_to_peak(&mut self, channel: u8, duration: Duration) -> Result<(f32, f32), AdcError> {
+        // This can read around 290*50 = 14500 samples per second which should be enough
+        let mut min = 1024;
+        let mut max = 0;
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < duration {
+            let reading = self.mcp.single_ended_read(channel)?;
+            if reading < min {
+                min = reading;
+            }
+            if reading > max {
+                max = reading;
+            }
+        }
+        let min_volts = Self::to_volts(min);
+        let max_volts = Self::to_volts(max);
+        Ok((min_volts, max_volts))
+    }
+
+    pub fn rms_voltage(&mut self, channel: u8, duration: Duration) -> Result<f32, AdcError> {
+        let mut sum = 0.0;
+        let mut count = 0;
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < duration {
+            let reading = self.mcp.single_ended_read(channel)?;
+            let volts = Self::to_volts(reading);
+            sum += volts * volts;
+            count += 1;
+        }
+        let rms = (sum / count as f32).sqrt();
+        Ok(rms)
+    }
 }
 
 #[cfg(test)]
@@ -107,7 +140,7 @@ mod tests {
     fn test_to_volts() {
         let reading = 512;
         let volts = Adc::to_volts(reading);
-        assert_eq!(volts, 1.65);
+        assert_eq!(volts, Adc::REFERENCE_VOLTAGE/2.);
     }
 
     #[test]
@@ -138,6 +171,17 @@ mod tests {
         let mut adc = Adc::new().unwrap();
         let reading = adc.mcp.single_ended_read(Adc::AC_VOLTAGE_CHANNEL).unwrap();
         let voltage = Adc::to_volts(reading);
+
+        let p2pv = adc.peak_to_peak(Adc::AC_VOLTAGE_CHANNEL, Duration::from_millis(1000/50));
+        assert!(p2pv.is_ok());
+        let (min, max) = p2pv.unwrap();
+
+        let rms = adc.rms_voltage(Adc::AC_VOLTAGE_CHANNEL, Duration::from_millis(1000/50));
+        assert!(rms.is_ok());
+        let rms = rms.unwrap();
+
+        println!("RMS: {}", rms);
+        println!("Min: {}, Max: {}", min, max);
         println!("AC Voltage: {}", voltage);
     }
 }
