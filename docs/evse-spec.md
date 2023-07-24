@@ -111,6 +111,17 @@ The following section describes the crucial steps of the service loop that shoul
     - `A -> B` or `B -> A` are informational, indicating plugging in or out.
     - `B -> C` or `B -> D` are requests for power.
     - `C -> B` or `D -> B` are requests to end power.
+
+3. **The Different states** as defined by the SAE_J1772 std:
+| Base status       | Charging status   | Resistance, CP-PE | Resistance, R2 | Voltage, CP-PE |
+|-------------------|-------------------|-------------------|----------------|----------------|
+| Status A          | Standby           | Open, or ∞ Ω      |                | +12 V          |
+| Status B          | Vehicle detected  | 2740 Ω            |                | +9±1 V         |
+| Status C          | Ready (charging)  | 882 Ω             | 1300 Ω         | +6±1 V         |
+| Status D          | With ventilation  | 246 Ω             | 270 Ω          | +3±1 V         |
+| Status E          | No power (shutoff)|                   |                | 0 V            |
+| Status F          | Error             |                   |                | −12 V          |
+
   
 3. **Power Request Response**: For a power request, perform a GFI self-test, then turn the power on. For a request to end power, turn the power off.
 
