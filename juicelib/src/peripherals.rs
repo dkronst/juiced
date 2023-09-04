@@ -119,12 +119,17 @@ impl GpioPeripherals {
 #[cfg(test)]
 mod testgpio {
     use std::time::Duration;
+    use lazy_static::lazy_static;
+    use std::sync::Mutex;
 
     use super::*;
+    lazy_static! {
+        static ref GPIO: Mutex<GpioPeripherals> = Mutex::new(GpioPeripherals::new());
+    }
 
     #[test]
     fn test_set_power_watchdog() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         gpio.set_power_watchdog(Level::High);
         thread::sleep(Duration::from_millis(100));
         gpio.set_power_watchdog(Level::Low);
@@ -132,37 +137,37 @@ mod testgpio {
 
     #[test]
     fn test_set_contactor_pin() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         gpio.set_contactor_pin(Level::High);
     }
 
     #[test]
     fn test_get_gfi_status_pin() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         assert_eq!(gpio.get_gfi_status_pin(), Level::Low);
     }
 
     #[test]
     fn test_get_relay_test_pin() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         assert_eq!(gpio.get_relay_test_pin(), Level::Low);
     }
 
     #[test]
     fn test_set_gfi_test_pin() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         gpio.set_gfi_test_pin(Level::High);
     }
 
     #[test]
     fn test_set_gfi_reset_pin() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         gpio.set_gfi_reset_pin(Level::High);
     }
 
     #[test]
     fn test_set_pilot_ampere() {
-        let mut gpio = GpioPeripherals::new();
+        let mut gpio = GPIO.lock().unwrap();
         gpio.set_pilot_ampere(32.0);
     }
 

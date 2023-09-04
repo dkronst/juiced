@@ -141,6 +141,7 @@ name = "juicelib"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "lazy_static",
  "linux-embedded-hal",
  "rand",
  "rppal 0.14.1",
