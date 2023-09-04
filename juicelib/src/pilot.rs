@@ -8,7 +8,7 @@ pub struct Pilot {
 impl Pilot {
     pub fn new() -> Result<Self, PwmError> {
         let pwm = Pwm::new(Channel::Pwm0)?;
-        pwm.set_period(Duration::from_millis(1))?;
+        pwm.set_period(Duration::from_millis(1))?; // 1KHz 
         pwm.enable()?;
 
         Ok(Self {

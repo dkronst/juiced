@@ -4,10 +4,14 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
+use std::error::Error;
 
+use rppal::gpio::Level;
 use rust_fsm::*;
 
-use crossbeam_channel::{Receiver, Sender, select};
+use crossbeam_channel::{Receiver, Select};
+
+use crate::peripherals::GpioPeripherals;
 
 
 // The states are summed up in the following table:
@@ -38,6 +42,7 @@ state_machine! {
         PilotIs9V => VehicleDetected [StartCharging],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
+        HardwareFault => FailedStation [HardwareFault],
     },
     VehicleDetected => {
         PilotIs12V => Standby [VehicleDisconnected],
@@ -45,6 +50,9 @@ state_machine! {
         PilotIs3V => VentilationNeeded,
         PilotIs0V => NoPower,
         PilotInError => ResetableError [PilotMeasurement],
+        GFIInterrupted => FailedStation [GFIError],
+        NoGround => FailedStation [NoGroundError],
+        HardwareFault => FailedStation [HardwareFault],
     },
     
     Charging => {
@@ -56,10 +64,11 @@ state_machine! {
         PilotInError => ResetableError [PilotMeasurement],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
+        HardwareFault => FailedStation [HardwareFault],
     },
     ResetableError => {
         PilotIs12V => Standby,    // This error can be reset by the user
-    }
+    },
 }
 
 // The state machine is the continuation of the main thread - i.e. it 
@@ -80,9 +89,181 @@ pub enum Fault {
     GFIInterrupted,
     NoGround,
     PilotInError,
-} 
+}
 
-pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<Fault>) -> ! 
+fn get_pilot_state(voltage: f32) -> EVSEMachineInput {
+    if  13.0 > voltage && voltage > 11.0 {
+        EVSEMachineInput::PilotIs12V
+    } else if 10.0 > voltage && voltage > 8.0 {
+        EVSEMachineInput::PilotIs9V
+    } else if 7.0 > voltage && voltage > 5.0 {
+        EVSEMachineInput::PilotIs6V
+    } else if 4.0 > voltage && voltage > 2.0 {
+        EVSEMachineInput::PilotIs3V
+    } else if 1.0 > voltage && voltage > -1.0 {
+        EVSEMachineInput::PilotIs0V
+    } else {
+        println!("Pilot voltage is out of range: {}", voltage);
+        EVSEMachineInput::PilotInError
+    }
+}
+
+fn get_new_state_input(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<Fault>) -> EVSEMachineInput {
+    let mut sel = Select::new();
+    sel.recv(&pilot_voltage_chan);
+    sel.recv(&fault_channel);
+    let oper = sel.select();
+    match oper.index() {
+        0 => {
+            let voltage = oper.recv(&pilot_voltage_chan);
+            if let Err(x) = voltage {
+                return EVSEMachineInput::PilotInError;
+            }
+            let voltage = voltage.unwrap();
+            get_pilot_state(voltage)
+        },
+        1 => {
+            // Fault channel
+            match oper.recv(&fault_channel) {
+                Ok(fault) => {
+                    match fault {
+                        Fault::GFIInterrupted => EVSEMachineInput::GFIInterrupted,
+                        Fault::NoGround => EVSEMachineInput::NoGround,
+                        Fault::PilotInError => EVSEMachineInput::PilotInError,
+                    }
+                },
+                Err(_) => {
+                    println!("Fault channel closed");
+                    EVSEMachineInput::PilotInError
+                }
+            }
+        },
+        _ => {
+            panic!("Invalid index");
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone)]
+pub struct HwError {
+    message: String,
+}
+
+impl Error for HwError {}
+
+impl std::fmt::Display for HwError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"{}", self.message)
+    }
+}
+
+pub trait EVSEHardware {
+    fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError>;
+    fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError>;
+    fn set_ground_test_pin(&mut self, state: OnOff) -> Result<(), HwError>;
+    fn get_contactor_state(&mut self) -> Result<OnOff, HwError>;
+
+    const MAX_CURRENT_OFFER: f32 = 32.0;
+}
+
+struct EVSEHardwareImpl {
+    contactor: OnOff,
+    current_offer: f32,
+    ground_test_pin: OnOff,
+    hw_peripherals: GpioPeripherals,
+}
+
+impl From<OnOff> for Level {
+    fn from(state: OnOff) -> Self {
+        match state {
+            OnOff::On => Level::High,
+            OnOff::Off => Level::Low,
+        }
+    }
+}
+
+impl From<Level> for OnOff {
+    fn from(state: Level) -> Self {
+        match state {
+            Level::High => OnOff::On,
+            Level::Low => OnOff::Off,
+        }
+    }
+}
+
+impl EVSEHardwareImpl {
+    fn new() -> Self {
+        let mut ret = Self {
+            contactor: OnOff::Off,
+            current_offer: 0.0,
+            ground_test_pin: OnOff::Off,
+            hw_peripherals: GpioPeripherals::new(),
+        };
+        ret.set_contactor(OnOff::Off).unwrap();
+        ret.set_current_offer_ampere(0.0).unwrap();
+        ret.set_gfi_test_pin(OnOff::Off).unwrap();
+        ret
+    }
+
+    fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
+        self.contactor = state.clone();
+        self.hw_peripherals.set_contactor_pin(state.into());
+        Ok(())
+    }
+
+    fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
+        self.hw_peripherals.set_pilot_ampere(ampere);
+        self.current_offer = ampere;
+        Ok(())
+    }
+
+    fn set_gfi_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
+        self.ground_test_pin = state.clone();
+        self.hw_peripherals.set_gfi_test_pin(state.into());
+        Ok(())
+    }
+
+    fn get_contactor_state(&mut self) -> Result<OnOff, HwError> {
+        Ok(self.hw_peripherals.get_relay_test_pin().into())
+    }
+}
+
+fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T) -> Result<(), HwError> 
+where T: EVSEHardware
+{
+    match state {
+        EVSEMachineState::Standby => {
+            hw.set_contactor(OnOff::Off)?;
+            hw.set_current_offer_ampere(0.0)?;
+            hw.set_ground_test_pin(OnOff::Off)?;
+        },
+        EVSEMachineState::VehicleDetected => {
+            hw.set_contactor(OnOff::Off)?;
+            hw.set_current_offer_ampere(T::MAX_CURRENT_OFFER)?;
+            hw.set_ground_test_pin(OnOff::On)?;
+        },        
+        EVSEMachineState::Charging => {
+            let state = hw.get_contactor_state()?;
+            if let OnOff::Off = state {
+                println!("Contactor is off. Turning it on");
+                hw.set_contactor(OnOff::On)?;
+            }
+        }
+        _ => {
+            hw.set_contactor(OnOff::Off)?;
+            // Do nothing
+        }
+    }
+    Ok(())
+}
+
+pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<Fault>, evse: &mut impl EVSEHardware) -> ! 
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
     loop {
@@ -117,46 +298,22 @@ pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<
                 // while the former is done every 10ms (at most) by the pilot measurement thread.
                 // We will decide on a pilot error, or we'll get one from the channel if 
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
-
-                // set_hardware_state(state);
-
-                let mut state_input = EVSEMachineInput::PilotInError;
-                let selector = select! {
-                    recv(pilot_voltage_chan) -> voltage => {
-                        match voltage {
-                            Ok(v) => {
-                                state_input = match v {
-                                    12.0 => EVSEMachineInput::PilotIs12V,
-                                    9.0 => EVSEMachineInput::PilotIs9V,
-                                    6.0 => EVSEMachineInput::PilotIs6V,
-                                    3.0 => EVSEMachineInput::PilotIs3V,
-                                    0.0 => EVSEMachineInput::PilotIs0V,
-                                    _ => EVSEMachineInput::PilotInError,
-                                };
-                            },
-                            Err(_) => {
-                                // Timeout occured, feed the machine with a PilotInError input
-                                state_input = EVSEMachineInput::PilotInError;
-                            }
-                        }
-                    },
-                    recv(fault_channel) -> fault => {
-                        match fault {
-                            Ok(f) => {
-                                state_input = match f {
-                                    Fault::GFIInterrupted => EVSEMachineInput::GFIInterrupted,
-                                    Fault::NoGround => EVSEMachineInput::NoGround,
-                                    Fault::PilotInError => EVSEMachineInput::PilotInError,
-                                };
-                            },
-                            Err(_) => {
-                                // Timeout occured, feed the machine with a PilotInError input
-                                state_input = EVSEMachineInput::PilotInError;
-                            }
-                        }
-                    }
-                };
                 
+                
+                let res = do_state_transition(state, evse);
+                let mut state_input = EVSEMachineInput::PilotInError;
+                if let Err(e) = res {
+                    eprintln!("Error: {}", e);
+                    state_input = EVSEMachineInput::HardwareFault;
+                    // Turn off the contactor, if we fail, we'll try again in the state transition
+                    // This is anyway only a secondary safety measure, since the hardware is already hard-wired
+                    // to turn off the contactor immediately if a something dangerous happens (no software), 
+                    // such as GFI for example.
+                    evse.set_contactor(OnOff::Off).unwrap_or(());     
+                } else {
+                    state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_channel.clone());
+                }
+                println!("State input: {:?}", state_input);                
                 let output = machine.consume(&state_input);
                 println!("Output: {:?}", output);
                 println!("State: {:?}", machine.state());
@@ -255,4 +412,24 @@ mod tests {
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
     }
 
+    #[test]
+    fn test_charging_finished() {
+        let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
+        let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
+        println!("Output: {:?}", output.unwrap());
+        println!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::Standby));
+        let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
+        println!("Output: {:?}", output.unwrap());
+        println!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
+        let output = machine.consume(&EVSEMachineInput::PilotIs6V).unwrap();
+        println!("Output: {:?}", output.unwrap());
+        println!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::Charging));
+        let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
+        println!("Output: {:?}", output.unwrap());
+        println!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
+    }
 }
