@@ -112,8 +112,10 @@ impl GpioPeripherals {
         self.gfi_test_pin.write(level);
     }
 
-    pub fn set_gfi_reset_pin(&mut self, level: Level) {
-        self.gfi_reset_pin.write(level);
+    pub fn gfi_reset(&mut self) {
+        self.gfi_reset_pin.write(Level::High);
+        thread::sleep(std::time::Duration::from_millis(100));
+        self.gfi_reset_pin.write(Level::Low);
     }
 }
 
