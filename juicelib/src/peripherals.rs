@@ -91,6 +91,7 @@ impl GpioPeripherals {
                 } else if state == Level::High {
                     wdp.write(Level::Low);
                 }
+                // TODO: Add frequency probe
             }
         });
     }
