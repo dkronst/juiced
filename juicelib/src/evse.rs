@@ -9,9 +9,12 @@ use std::error::Error;
 use rppal::gpio::Level;
 use rust_fsm::*;
 
+use log::{info, warn, error, debug};
+
 use crossbeam_channel::{Receiver, Select};
 
 use crate::peripherals::GpioPeripherals;
+
 
 
 // The states are summed up in the following table:
@@ -103,7 +106,7 @@ fn get_pilot_state(voltage: f32) -> EVSEMachineInput {
     } else if 1.0 > voltage && voltage > -1.0 {
         EVSEMachineInput::PilotIs0V
     } else {
-        println!("Pilot voltage is out of range: {}", voltage);
+        info!("Pilot voltage is out of range: {}", voltage);
         EVSEMachineInput::PilotInError
     }
 }
@@ -133,7 +136,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<f32>, fault_channel: Receive
                     }
                 },
                 Err(_) => {
-                    println!("Fault channel closed");
+                    info!("Fault channel closed");
                     EVSEMachineInput::PilotInError
                 }
             }
@@ -275,7 +278,7 @@ where T: EVSEHardware
         EVSEMachineState::Charging => {
             let state = hw.get_contactor_state()?;
             if let OnOff::Off = state {
-                println!("Contactor is off. Turning it on");
+                info!("Contactor is off. Turning it on");
                 hw.set_contactor(OnOff::On)?;
             }
         }
@@ -296,14 +299,14 @@ pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<
                 // Do the self test
                 let self_test_result = run_self_test(); // TODO: What's needed here?
                 let output = machine.consume(&self_test_result).unwrap();
-                println!("Output: {:?}", output.unwrap());
-                println!("State: {:?}", machine.state());
+                info!("Output: {:?}", output.unwrap());
+                info!("State: {:?}", machine.state());
             },
             EVSEMachineState::ResetableError => {
                 todo!("Reset the error");
             },
             EVSEMachineState::FailedStation => {
-                eprintln!("Station failed. Full reset required, contact admin if the issue persists.");
+                error!("Station failed. Full reset required, contact admin if the issue persists.");
                 panic!("Fatal Error");
             },
             state => {
@@ -327,7 +330,7 @@ pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<
                 let res = do_state_transition(state, evse);
                 let mut state_input = EVSEMachineInput::PilotInError;
                 if let Err(e) = res {
-                    eprintln!("Error: {}", e);
+                    error!("Error: {}", e);
                     state_input = EVSEMachineInput::HardwareFault;
                     // Turn off the contactor, if we fail, we'll try again in the state transition
                     // This is anyway only a secondary safety measure, since the hardware is already hard-wired
@@ -337,10 +340,10 @@ pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<
                 } else {
                     state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_channel.clone());
                 }
-                println!("State input: {:?}", state_input);                
+                info!("State input: {:?}", state_input);                
                 let output = machine.consume(&state_input);
-                println!("Output: {:?}", output);
-                println!("State: {:?}", machine.state());
+                info!("Output: {:?}", output);
+                info!("State: {:?}", machine.state());
             }
         }
     }
@@ -354,16 +357,16 @@ mod tests {
     fn test_new_sm() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output);
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output);
+        info!("State: {:?}", machine.state());
     }
 
     #[test]
     fn test_self_test() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestFailed).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::FailedStation));
     }
 
@@ -371,8 +374,8 @@ mod tests {
     fn test_standby() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
     }
 
@@ -380,12 +383,12 @@ mod tests {
     fn test_gfi_interrupted() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
         let output = machine.consume(&EVSEMachineInput::GFIInterrupted).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::FailedStation));
     }
 
@@ -393,12 +396,12 @@ mod tests {
     fn test_no_ground() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
         let output = machine.consume(&EVSEMachineInput::NoGround).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::FailedStation));
     }
 
@@ -406,16 +409,16 @@ mod tests {
     fn test_start_charging() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
         let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
         let output = machine.consume(&EVSEMachineInput::PilotIs6V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Charging));
     }
 
@@ -423,16 +426,16 @@ mod tests {
     fn test_vehicle_left() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
         let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
         let output = machine.consume(&EVSEMachineInput::PilotIs12V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
     }
 
@@ -440,20 +443,20 @@ mod tests {
     fn test_charging_finished() {
         let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
         let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Standby));
         let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
         let output = machine.consume(&EVSEMachineInput::PilotIs6V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Charging));
         let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
-        println!("Output: {:?}", output.unwrap());
-        println!("State: {:?}", machine.state());
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
     }
 }

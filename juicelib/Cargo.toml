@@ -15,4 +15,5 @@ rust-fsm = "0.6"
 crossbeam-channel = "0.5"
 lazy_static = "1.4"
 error-stack = "0.4"
+log = "0.4"
 

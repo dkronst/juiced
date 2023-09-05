@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi, Error as LibError};
+use log::info;
 
 // This file defines a private (to this crate) struct called Adc. It has a
 // public method called new() which returns a Result<Adc, AdcError>. The
@@ -102,7 +103,7 @@ impl Adc {
         let mut max = 0;
         let start = std::time::Instant::now();
 
-        while start.elapsed() < duration {
+        while start.elapsed() < duration {  
             let reading = self.mcp.single_ended_read(channel)?;
             if reading < min {
                 min = reading;
@@ -180,8 +181,8 @@ mod tests {
         assert!(rms.is_ok());
         let rms = rms.unwrap();
 
-        println!("RMS: {}", rms);
-        println!("Min: {}, Max: {}", min, max);
-        println!("AC Voltage: {}", voltage);
+        info!("RMS: {}", rms);
+        info!("Min: {}, Max: {}", min, max);
+        info!("AC Voltage: {}", voltage);
     }
 }

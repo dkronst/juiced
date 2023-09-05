@@ -2,7 +2,15 @@
 use juicelib::evse::{start_machine, Fault, EVSEHardware, EVSEHardwareImpl};
 use crossbeam_channel::bounded;
 
+use log::{info, warn, error, debug, trace};
+use simplelog::{SimpleLogger, LevelFilter, Config, TerminalMode};
+
+fn initiate_logging() {
+    let _ = SimpleLogger::init(LevelFilter::Trace, Config::default());
+}
+
 fn main() {
+    initiate_logging();
     let mut evse = EVSEHardwareImpl::new();
     
     let (fault_tx, fault_rx) = bounded(1);
