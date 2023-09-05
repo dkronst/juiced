@@ -172,7 +172,7 @@ pub trait EVSEHardware {
     const MAX_CURRENT_OFFER: f32 = 32.0;
 }
 
-struct EVSEHardwareImpl {
+pub struct EVSEHardwareImpl {
     contactor: OnOff,
     current_offer: f32,
     ground_test_pin: OnOff,
@@ -198,7 +198,7 @@ impl From<Level> for OnOff {
 }
 
 impl EVSEHardwareImpl {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut ret = Self {
             contactor: OnOff::Off,
             current_offer: 0.0,
@@ -224,6 +224,30 @@ impl EVSEHardwareImpl {
     }
 
     fn set_gfi_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
+        self.ground_test_pin = state.clone();
+        self.hw_peripherals.set_gfi_test_pin(state.into());
+        Ok(())
+    }
+
+    fn get_contactor_state(&mut self) -> Result<OnOff, HwError> {
+        Ok(self.hw_peripherals.get_relay_test_pin().into())
+    }
+}
+
+impl EVSEHardware for EVSEHardwareImpl {
+    fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
+        self.contactor = state.clone();
+        self.hw_peripherals.set_contactor_pin(state.into());
+        Ok(())
+    }
+
+    fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
+        self.hw_peripherals.set_pilot_ampere(ampere);
+        self.current_offer = ampere;
+        Ok(())
+    }
+
+    fn set_ground_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
         self.ground_test_pin = state.clone();
         self.hw_peripherals.set_gfi_test_pin(state.into());
         Ok(())
