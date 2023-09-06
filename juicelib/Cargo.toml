@@ -11,7 +11,7 @@ rust_gpiozero = "0.2"
 spidev = "0.6"
 rppal = "0.14"
 rand = "0.8"
-rust-fsm = "0.6"
+rust-fsm = { version = "0.6", features = ["dsl", "std"] }
 crossbeam-channel = "0.5"
 lazy_static = "1.4"
 error-stack = "0.4"

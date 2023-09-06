@@ -1,4 +1,4 @@
-use std::{sync::{atomic::AtomicBool, Arc}, thread};
+use std::{sync::{atomic::AtomicBool, Arc, Mutex, MutexGuard}, thread};
 
 ///
 /// Implementation of the peripherals module.
@@ -6,7 +6,7 @@ use std::{sync::{atomic::AtomicBool, Arc}, thread};
 
 // use gpio's hal
 use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
-use crate::pilot::Pilot;
+use crate::{pilot::Pilot, adc::Adc};
 
 /// ## GPIO Pin Configuration
 /// Please note the following descriptions refer to GPIO numbers, not actual pin numbers on the Raspberry Pi GPIO connector:
@@ -28,14 +28,20 @@ const RELAY_TEST_PIN: u8 = 23;
 const GFI_TEST_PIN: u8 = 24;
 const GFI_RESET_PIN: u8 = 27;
 
+pub struct Pins {
+    gpio: Gpio,
+    pub contactor_pin: OutputPin,
+    pub gfi_status_pin: InputPin,
+    pub relay_test_pin: InputPin,
+    pub gfi_test_pin: OutputPin,
+    pub gfi_reset_pin: OutputPin,
+}
+
 pub struct GpioPeripherals {
     pilot: Pilot,
-    contactor_pin: OutputPin,
-    gfi_status_pin: InputPin,
-    relay_test_pin: InputPin,
-    gfi_test_pin: OutputPin,
-    gfi_reset_pin: OutputPin,
+    adc: Arc<Mutex<Adc>>,
     power_watchdog: Arc<AtomicBool>,
+    pins: Arc<Mutex<Pins>>,
 }
 
 impl GpioPeripherals {
@@ -54,20 +60,35 @@ impl GpioPeripherals {
         let power_watchdog = Arc::new(AtomicBool::new(false));
 
         Self::power_pin_thread(power_watchdog_pin, Arc::clone(&power_watchdog));
+        let adc = Arc::new(Mutex::new(Adc::new().unwrap()));
+
+        let pins = Arc::new(Mutex::new(Pins {
+            gpio: gpio,
+            contactor_pin: contactor_pin,
+            gfi_status_pin: gfi_status_pin,
+            relay_test_pin: relay_test_pin,
+            gfi_test_pin: gfi_test_pin,
+            gfi_reset_pin: gfi_reset_pin,
+        }));
 
         Self {
+            adc: adc,
             power_watchdog: power_watchdog,
             pilot: pilot,
-            contactor_pin,
-            gfi_status_pin,
-            relay_test_pin,
-            gfi_test_pin,
-            gfi_reset_pin,
+            pins: pins,
         }
     }
 
-    pub fn set_power_watchdog(&mut self, _level: Level) {
-        self.power_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
+    pub fn get_adc(&mut self) -> Arc<Mutex<Adc>> {
+        Arc::clone(&self.adc)
+    }
+
+    pub fn set_power_watchdog(&mut self, level: Level) {
+        let state = match level {
+            Level::Low => false,
+            Level::High => true,
+        };
+        self.power_watchdog.store(state, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_pilot_ampere(&mut self, ampere: f32) {
@@ -97,25 +118,36 @@ impl GpioPeripherals {
     }
 
     pub fn set_contactor_pin(&mut self, level: Level) {
-        self.contactor_pin.write(level);
+        let mut pins = self.pins.lock().unwrap();
+        pins.contactor_pin.write(level);
     }
 
-    pub fn get_gfi_status_pin(&mut self) -> Level {
-        self.gfi_status_pin.read()
+    pub fn read_gfi_status_pin(&self) -> Level {
+        let pins = self.pins.lock().unwrap();
+        pins.gfi_status_pin.read()
     }
 
-    pub fn get_relay_test_pin(&mut self) -> Level {
-        self.relay_test_pin.read()
+    pub fn get_pins(&mut self) -> Arc<Mutex<Pins>> {
+        // TODO: Get rid of the unwrap
+        Arc::clone(&self.pins)
+    }
+
+    pub fn read_relay_test_pin(&self) -> Level {
+        let pins = self.pins.lock().unwrap();
+        pins.relay_test_pin.read()
     }
 
     pub fn set_gfi_test_pin(&mut self, level: Level) {
-        self.gfi_test_pin.write(level);
+        // TODO: Oscillate at 50 Hz
+        let mut pins = self.pins.lock().unwrap();
+        pins.gfi_test_pin.write(level);
     }
 
     pub fn gfi_reset(&mut self) {
-        self.gfi_reset_pin.write(Level::High);
+        let mut pins = self.pins.lock().unwrap();
+        pins.gfi_reset_pin.write(Level::High);
         thread::sleep(std::time::Duration::from_millis(100));
-        self.gfi_reset_pin.write(Level::Low);
+        pins.gfi_reset_pin.write(Level::Low);
     }
 }
 
@@ -146,14 +178,14 @@ mod testgpio {
 
     #[test]
     fn test_get_gfi_status_pin() {
-        let mut gpio = GPIO.lock().unwrap();
-        assert_eq!(gpio.get_gfi_status_pin(), Level::Low);
+        let gpio = GPIO.lock().unwrap();
+        assert_eq!(gpio.read_gfi_status_pin(), Level::Low);
     }
 
     #[test]
     fn test_get_relay_test_pin() {
-        let mut gpio = GPIO.lock().unwrap();
-        assert_eq!(gpio.get_relay_test_pin(), Level::Low);
+        let gpio = GPIO.lock().unwrap();
+        assert_eq!(gpio.read_relay_test_pin(), Level::Low);
     }
 
     #[test]
@@ -165,7 +197,7 @@ mod testgpio {
     #[test]
     fn test_set_gfi_reset_pin() {
         let mut gpio = GPIO.lock().unwrap();
-        gpio.set_gfi_reset_pin(Level::High);
+        gpio.gfi_reset();
     }
 
     #[test]

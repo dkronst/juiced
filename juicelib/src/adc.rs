@@ -39,11 +39,11 @@ impl From<std::io::Error> for AdcError {
 
 // Define the trait:
 pub trait Mcp3004 {
-    fn single_ended_read(&mut self, channel: u8) -> Result<u16, LibError>;
+    fn single_ended_read(&self, channel: u8) -> Result<u16, LibError>;
 }
 
 impl Mcp3004 for Spi {
-    fn single_ended_read(&mut self, channel: u8) -> Result<u16, LibError> {
+    fn single_ended_read(&self, channel: u8) -> Result<u16, LibError> {
         let mut read_buffer = [0u8; 3];
         let write_buffer = [0b0000_0001, (0b1000_0000 | (channel << 4)) as u8, 0];
 
@@ -91,13 +91,19 @@ impl Adc {
         Ok(voltage)
     }
 
+    #[inline]
+    pub fn peak_to_peak_pilot(&self) -> Result<(f32, f32), AdcError> {
+        // TODO: fix so that the voltage is corrected for the voltage divider
+        self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(2*1000/50)) // 2 cycles, TODO: use constants
+    }
+
     pub fn read_current_sense(&mut self) -> Result<f32, AdcError> {
         let reading = self.mcp.single_ended_read(Self::CURRENT_SENSE_CHANNEL)?;
         let curr = Self::to_amps(reading);
         Ok(curr)
     }
 
-    pub fn peak_to_peak(&mut self, channel: u8, duration: Duration) -> Result<(f32, f32), AdcError> {
+    pub fn peak_to_peak(&self, channel: u8, duration: Duration) -> Result<(f32, f32), AdcError> {
         // This can read around 290*50 = 14500 samples per second which should be enough
         let mut min = 1024;
         let mut max = 0;

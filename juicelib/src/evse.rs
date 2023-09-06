@@ -4,14 +4,14 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::error::Error;
+use std::{error::Error, thread, sync::Arc};
 
-use rppal::gpio::Level;
+use rppal::gpio::{Level, Gpio, Trigger};
 use rust_fsm::*;
 
 use log::{info, warn, error, debug};
 
-use crossbeam_channel::{Receiver, Select};
+use crossbeam_channel::{Receiver, Select, bounded};
 
 use crate::peripherals::GpioPeripherals;
 
@@ -83,18 +83,18 @@ fn run_self_test() -> EVSEMachineInput {
     EVSEMachineInput::SelfTestOk
 }
 
-fn listen_to_pilot() -> EVSEMachineInput {
-    // Listen to the input from the pilot
-    EVSEMachineInput::PilotIs9V
-}
-
 pub enum Fault {
     GFIInterrupted,
     NoGround,
     PilotInError,
 }
 
-fn get_pilot_state(voltage: f32) -> EVSEMachineInput {
+fn get_pilot_state(min_max: (f32, f32)) -> EVSEMachineInput {
+    let (vm12, voltage) = min_max;
+    if (vm12 > -11.0 && vm12 > -13.0) && vm12 < 0.0 {    // If the pilot is oscilating?
+        info!("Pilot minimum voltage is out of range: {}", vm12);
+        return EVSEMachineInput::PilotInError;
+    }
     if  13.0 > voltage && voltage > 11.0 {
         EVSEMachineInput::PilotIs12V
     } else if 10.0 > voltage && voltage > 8.0 {
@@ -111,7 +111,7 @@ fn get_pilot_state(voltage: f32) -> EVSEMachineInput {
     }
 }
 
-fn get_new_state_input(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<Fault>) -> EVSEMachineInput {
+    fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: Receiver<Fault>) -> EVSEMachineInput {
     let mut sel = Select::new();
     sel.recv(&pilot_voltage_chan);
     sel.recv(&fault_channel);
@@ -122,7 +122,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<f32>, fault_channel: Receive
             if let Err(x) = voltage {
                 return EVSEMachineInput::PilotInError;
             }
-            let voltage = voltage.unwrap();
+            let voltage: (f32, f32) = voltage.unwrap();
             get_pilot_state(voltage)
         },
         1 => {
@@ -166,11 +166,49 @@ impl std::fmt::Display for HwError {
     }
 }
 
+fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32)>, HwError> {
+    let (pilot_tx, pilot_rx) = bounded(1);
+    let adc = periph.get_adc();
+    thread::spawn(move || {
+        loop {
+            let (min, max) = adc.lock().unwrap().peak_to_peak_pilot().unwrap();
+            match pilot_tx.send((min, max)) {
+                Err(_) => {
+                    error!("Pilot channel closed");
+                    break;
+                },
+                _ => {}
+            }
+        }
+    });
+    Ok(pilot_rx)
+}
+
+fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, HwError> {
+    let (fault_tx, fault_rx) = bounded(1);
+    let pins = periph.get_pins();
+
+    thread::spawn(move || {
+        loop {
+            pins.lock().unwrap().gfi_status_pin.set_interrupt(Trigger::RisingEdge).unwrap();
+            let _ = pins.lock().unwrap().gfi_status_pin.poll_interrupt(true, None);
+            // poll the GFI pina
+            warn!("GFI Interrupted");
+            thread::sleep(std::time::Duration::from_millis(100));
+            fault_tx.send(Fault::GFIInterrupted).unwrap();
+            info!("GFI message sent to channel");
+        }
+    });
+    Ok(fault_rx)
+}
+
+
 pub trait EVSEHardware {
     fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError>;
     fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError>;
     fn set_ground_test_pin(&mut self, state: OnOff) -> Result<(), HwError>;
     fn get_contactor_state(&mut self) -> Result<OnOff, HwError>;
+    fn get_peripherals(&mut self) -> &mut GpioPeripherals;
 
     const MAX_CURRENT_OFFER: f32 = 32.0;
 }
@@ -233,7 +271,7 @@ impl EVSEHardwareImpl {
     }
 
     fn get_contactor_state(&mut self) -> Result<OnOff, HwError> {
-        Ok(self.hw_peripherals.get_relay_test_pin().into())
+        Ok(self.hw_peripherals.read_relay_test_pin().into())
     }
 }
 
@@ -257,7 +295,11 @@ impl EVSEHardware for EVSEHardwareImpl {
     }
 
     fn get_contactor_state(&mut self) -> Result<OnOff, HwError> {
-        Ok(self.hw_peripherals.get_relay_test_pin().into())
+        Ok(self.hw_peripherals.read_relay_test_pin().into())
+    }
+
+    fn get_peripherals(&mut self) -> &mut GpioPeripherals {
+        &mut self.hw_peripherals
     }
 }
 
@@ -290,9 +332,14 @@ where T: EVSEHardware
     Ok(())
 }
 
-pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<Fault>, evse: &mut impl EVSEHardware) -> ! 
+pub fn start_machine<T>(mut evse: T) -> !
+where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
+
+    let pilot_voltage_chan = start_pilot_thread(evse.get_peripherals()).unwrap();
+    let fault_chan = start_fault_thread(evse.get_peripherals()).unwrap();
+
     loop {
         match machine.state() {
             EVSEMachineState::SelfTest => {
@@ -327,7 +374,7 @@ pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
                 
-                let res = do_state_transition(state, evse);
+                let res = do_state_transition(state, &mut evse);
                 let mut state_input = EVSEMachineInput::PilotInError;
                 if let Err(e) = res {
                     error!("Error: {}", e);
@@ -338,7 +385,7 @@ pub fn start_machine(pilot_voltage_chan: Receiver<f32>, fault_channel: Receiver<
                     // such as GFI for example.
                     evse.set_contactor(OnOff::Off).unwrap_or(());     
                 } else {
-                    state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_channel.clone());
+                    state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
                 }
                 info!("State input: {:?}", state_input);                
                 let output = machine.consume(&state_input);
