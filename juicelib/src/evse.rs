@@ -111,7 +111,8 @@ fn get_pilot_state(min_max: (f32, f32)) -> EVSEMachineInput {
     }
 }
 
-    fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: Receiver<Fault>) -> EVSEMachineInput {
+fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: Receiver<Fault>) -> EVSEMachineInput {
+    info!("Waiting for pilot voltage");
     let mut sel = Select::new();
     sel.recv(&pilot_voltage_chan);
     sel.recv(&fault_channel);
@@ -167,7 +168,7 @@ impl std::fmt::Display for HwError {
 }
 
 fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32)>, HwError> {
-    let (pilot_tx, pilot_rx) = bounded(1);
+    let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
     thread::spawn(move || {
         loop {
@@ -185,13 +186,16 @@ fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32
 }
 
 fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, HwError> {
-    let (fault_tx, fault_rx) = bounded(1);
+    let (fault_tx, fault_rx) = bounded(16);
     let pins = periph.get_pins();
 
     thread::spawn(move || {
         loop {
-            pins.lock().unwrap().gfi_status_pin.set_interrupt(Trigger::RisingEdge).unwrap();
-            let _ = pins.lock().unwrap().gfi_status_pin.poll_interrupt(true, None);
+            {
+                let mut locked_pins = pins.lock().unwrap();
+                locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge).unwrap();
+                locked_pins.gfi_status_pin.poll_interrupt(true, None).unwrap();
+            }
             // poll the GFI pina
             warn!("GFI Interrupted");
             thread::sleep(std::time::Duration::from_millis(100));
@@ -306,6 +310,7 @@ impl EVSEHardware for EVSEHardwareImpl {
 fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T) -> Result<(), HwError> 
 where T: EVSEHardware
 {
+    info!("Do state transition: {:?}", state);
     match state {
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
@@ -329,6 +334,7 @@ where T: EVSEHardware
             // Do nothing
         }
     }
+    info!("State transition done");
     Ok(())
 }
 

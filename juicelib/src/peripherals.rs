@@ -1,4 +1,4 @@
-use std::{sync::{atomic::AtomicBool, Arc, Mutex, MutexGuard}, thread};
+use std::{sync::{atomic::AtomicBool, Arc, Mutex}, thread};
 
 ///
 /// Implementation of the peripherals module.
@@ -7,6 +7,8 @@ use std::{sync::{atomic::AtomicBool, Arc, Mutex, MutexGuard}, thread};
 // use gpio's hal
 use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
 use crate::{pilot::Pilot, adc::Adc};
+
+use log::{info, warn, error, debug, trace};
 
 /// ## GPIO Pin Configuration
 /// Please note the following descriptions refer to GPIO numbers, not actual pin numbers on the Raspberry Pi GPIO connector:
@@ -118,8 +120,11 @@ impl GpioPeripherals {
     }
 
     pub fn set_contactor_pin(&mut self, level: Level) {
+        info!("locking pins");
         let mut pins = self.pins.lock().unwrap();
+        info!("pins locked");
         pins.contactor_pin.write(level);
+        info!("done locking pins");
     }
 
     pub fn read_gfi_status_pin(&self) -> Level {
