@@ -4,9 +4,9 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{error::Error, thread, sync::Arc};
+use std::{error::Error, thread, sync::{Arc, PoisonError}, f32::consts::E};
 
-use rppal::gpio::{Level, Gpio, Trigger};
+use rppal::gpio::{Level, Gpio, Trigger, self};
 use rust_fsm::*;
 
 use log::{info, warn, error, debug};
@@ -42,7 +42,10 @@ state_machine! {
         SelfTestFailed => FailedStation [SelfTestError]
     },
     Standby => {
+        PilotIs12V => Standby [VehicleDisconnected],
         PilotIs9V => VehicleDetected [StartCharging],
+        PilotIs6V => ResetableError[Illegal],
+        PilotIs3V => ResetableError[Illegal],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
         HardwareFault => FailedStation [HardwareFault],
@@ -123,6 +126,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
             if let Err(x) = voltage {
                 return EVSEMachineInput::PilotInError;
             }
+            debug!("Pilot voltage: {:?}", voltage);
             let voltage: (f32, f32) = voltage.unwrap();
             get_pilot_state(voltage)
         },
@@ -167,6 +171,22 @@ impl std::fmt::Display for HwError {
     }
 }
 
+impl From<gpio::Error> for HwError {
+    fn from(error: gpio::Error) -> Self {
+        Self {
+            message: format!("GPIO Error: {}", error),
+        }
+    }
+}
+
+impl<T> From<PoisonError<T>> for HwError {
+    fn from(error: PoisonError<T>) -> Self {
+        Self {
+            message: format!("Poison Error: {}", error),
+        }
+    }
+}
+
 fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32)>, HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
@@ -189,20 +209,16 @@ fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, H
     let (fault_tx, fault_rx) = bounded(16);
     let pins = periph.get_pins();
 
-    thread::spawn(move || {
-        loop {
-            {
-                let mut locked_pins = pins.lock().unwrap();
-                locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge).unwrap();
-                locked_pins.gfi_status_pin.poll_interrupt(true, None).unwrap();
-            }
-            // poll the GFI pina
+    let mut locked_pins = pins.lock()?;
+    locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge)?;
+    locked_pins.gfi_status_pin.set_async_interrupt(
+        Trigger::RisingEdge,
+        move |_| {
             warn!("GFI Interrupted");
-            thread::sleep(std::time::Duration::from_millis(100));
             fault_tx.send(Fault::GFIInterrupted).unwrap();
             info!("GFI message sent to channel");
         }
-    });
+    ).map_err(|e| HwError{message: format!("Error setting GFI interrupt: {}", e)})?;
     Ok(fault_rx)
 }
 
