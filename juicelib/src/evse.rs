@@ -4,7 +4,7 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{error::Error, thread, sync::{Arc, PoisonError}, f32::consts::E};
+use std::{error::Error, thread, sync::{Arc, PoisonError}, f32::consts::E, time::Duration};
 
 use rppal::gpio::{Level, Gpio, Trigger, self};
 use rust_fsm::*;
@@ -330,7 +330,7 @@ where T: EVSEHardware
     match state {
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
-            hw.set_current_offer_ampere(0.0)?;
+            hw.set_current_offer_ampere(10.0)?;
             hw.set_ground_test_pin(OnOff::Off)?;
         },
         EVSEMachineState::VehicleDetected => {
@@ -372,7 +372,7 @@ where T: EVSEHardware + Send + Sync
                 info!("State: {:?}", machine.state());
             },
             EVSEMachineState::ResetableError => {
-                todo!("Reset the error");
+                // todo!("Reset the error");
             },
             EVSEMachineState::FailedStation => {
                 error!("Station failed. Full reset required, contact admin if the issue persists.");
@@ -396,6 +396,7 @@ where T: EVSEHardware + Send + Sync
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
                 
+                evse.set_current_offer_ampere(10.0).unwrap();
                 let res = do_state_transition(state, &mut evse);
                 let mut state_input = EVSEMachineInput::PilotInError;
                 if let Err(e) = res {

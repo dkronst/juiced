@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi, Error as LibError};
-use log::info;
+use log::{debug, info};
 
 // This file defines a private (to this crate) struct called Adc. It has a
 // public method called new() which returns a Result<Adc, AdcError>. The
@@ -45,11 +45,12 @@ pub trait Mcp3004 {
 impl Mcp3004 for Spi {
     fn single_ended_read(&self, channel: u8) -> Result<u16, LibError> {
         let mut read_buffer = [0u8; 3];
-        let write_buffer = [0b0000_0001, (0b1000_0000 | (channel << 4)) as u8, 0];
+        let write_buffer = [0b0000_0001, 0b1000_0000 | channel << 4, 0b0000_0000];
 
         self.transfer(&mut read_buffer, &write_buffer)?;
 
         let value = ((read_buffer[1] as u16 & 0x03) << 8) | read_buffer[2] as u16;
+        // debug!("Read: {:?}, Write: {:?}, value: {}", read_buffer, write_buffer, value);
 
         Ok(value)
     }
@@ -60,7 +61,7 @@ impl Adc {
     const PILOT_VOLTAGE_CHANNEL: u8 = 0;
     const CURRENT_SENSE_CHANNEL: u8 = 1;
     const AC_VOLTAGE_CHANNEL:    u8 = 2;
-    const SPI_FREQUENCY:        u32 = 1_000_000;
+    const SPI_FREQUENCY:        u32 = 300_000;  // Tested empirically, 300kHz is the fastest that works linearly.
     const SPI_MODE:            Mode = Mode::Mode0;
     const SPI_BUS:              Bus = Bus::Spi0;
     const SPI_SLAVE_SELECT: SlaveSelect = SlaveSelect::Ss0;
@@ -92,9 +93,22 @@ impl Adc {
     }
 
     #[inline]
+    fn from_vdiv_to_pilot(voltage: f32) -> f32 {      
+        // 0.9V means -12V, 4.55V means +12V. Between those values, the reading should be linear.
+        // Linear equation: y-y_0 = M(x-x_0)
+        // M = (V_p-V_0p)/(V_d-V_0d) = (12-(-12))/(4.55-0.9) = 24/3.65
+        // V_0p = -12, V_0d = 0.9
+        // V_p = 24/3.65*V_d - 24/3.65*0.9 - 12
+        let pilot_voltage = 24./3.65*voltage - 24./3.65*0.9 - 12.;
+        debug!("Vdiv: {}, Pilot: {}", voltage, pilot_voltage);
+        pilot_voltage
+    }
+
+    #[inline]
     pub fn peak_to_peak_pilot(&self) -> Result<(f32, f32), AdcError> {
         // TODO: fix so that the voltage is corrected for the voltage divider
-        self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(2*1000/50)) // 2 cycles, TODO: use constants
+        let (min, max) = self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(10))?; // 10 cycles?
+        Ok((Self::from_vdiv_to_pilot(min), Self::from_vdiv_to_pilot(max)))
     }
 
     pub fn read_current_sense(&mut self) -> Result<f32, AdcError> {
@@ -190,5 +204,18 @@ mod tests {
         info!("RMS: {}", rms);
         info!("Min: {}, Max: {}", min, max);
         info!("AC Voltage: {}", voltage);
+    }
+
+    #[test]
+    fn test_vdiv_pilot() {
+        println!("0.9V means -12V, 4.55V means +12V. Between those values, the reading should be linear.");
+        println!("Linear equation: y-y_0 = M(x-x_0)");
+        for i in 0..10 {
+            let voltage = 0.9 + i as f32 * (4.55-0.9)/10.;
+            let pilot_voltage = Adc::from_vdiv_to_pilot(voltage);
+            println!("Vdiv: {}, Pilot: {}", voltage, pilot_voltage);
+        }
+        assert_eq!(Adc::from_vdiv_to_pilot(4.55), 12.0);
+        assert_eq!(Adc::from_vdiv_to_pilot(0.9), -12.0);
     }
 }
