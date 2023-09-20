@@ -4,16 +4,20 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{error::Error, thread, sync::{Arc, PoisonError}, f32::consts::E, time::Duration};
+use std::{error::Error, thread, sync::{PoisonError}, f32::consts::E, time::Duration};
 
-use rppal::gpio::{Level, Gpio, Trigger, self};
+use rppal::gpio::{Level, Gpio, Trigger};
 use rust_fsm::*;
+
+use error_stack::{Context, Report, Result, ResultExt};
 
 use log::{info, warn, error, debug};
 
 use crossbeam_channel::{Receiver, Select, bounded};
 
 use crate::peripherals::GpioPeripherals;
+
+
 
 
 
@@ -158,32 +162,18 @@ pub enum OnOff {
     Off,
 }
 
-#[derive(Debug, Clone)]
-pub struct HwError {
-    message: String,
+#[derive(Debug)]
+pub enum HwError {
+    PoisonError,
+    GpioError,
+    HardwareFault
 }
 
-impl Error for HwError {}
+impl Context for HwError {}
 
 impl std::fmt::Display for HwError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f,"{}", self.message)
-    }
-}
-
-impl From<gpio::Error> for HwError {
-    fn from(error: gpio::Error) -> Self {
-        Self {
-            message: format!("GPIO Error: {}", error),
-        }
-    }
-}
-
-impl<T> From<PoisonError<T>> for HwError {
-    fn from(error: PoisonError<T>) -> Self {
-        Self {
-            message: format!("Poison Error: {}", error),
-        }
+        write!(f,"Hardware Error Detected")
     }
 }
 
@@ -192,7 +182,11 @@ fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32
     let adc = periph.get_adc();
     thread::spawn(move || {
         loop {
-            let (min, max) = adc.lock().unwrap().peak_to_peak_pilot().unwrap();
+            let (min, max);
+            {
+                (min, max) = adc.lock().unwrap().peak_to_peak_pilot().unwrap();
+            }
+            thread::sleep(Duration::from_millis(100));
             match pilot_tx.send((min, max)) {
                 Err(_) => {
                     error!("Pilot channel closed");
@@ -209,16 +203,22 @@ fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, H
     let (fault_tx, fault_rx) = bounded(16);
     let pins = periph.get_pins();
 
-    let mut locked_pins = pins.lock()?;
-    locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge)?;
-    locked_pins.gfi_status_pin.set_async_interrupt(
+    let mut locked_pins = pins.lock().
+        map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
+    locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge).or_else(|e| {
+        Err(Report::new(e).change_context(HwError::GpioError)).attach_printable("failed setting interrupt on GFI status pin")
+    })?;
+    let res = locked_pins.gfi_status_pin.set_async_interrupt(
         Trigger::RisingEdge,
         move |_| {
             warn!("GFI Interrupted");
             fault_tx.send(Fault::GFIInterrupted).unwrap();
             info!("GFI message sent to channel");
         }
-    ).map_err(|e| HwError{message: format!("Error setting GFI interrupt: {}", e)})?;
+    ).map_err(|e| {
+        Report::new(e).change_context(HwError::GpioError).attach_printable("failed setting async interrupt on GFI status pin")
+    })?;
+    
     Ok(fault_rx)
 }
 
