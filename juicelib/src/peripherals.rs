@@ -1,5 +1,6 @@
-use std::{sync::{atomic::AtomicBool, Arc, Mutex}, thread};
+use std::{sync::{atomic::AtomicBool, Arc, Mutex}, thread, time::Duration, fmt::{Display, Formatter, self}};
 
+use error_stack::{Context, ResultExt, Result};
 ///
 /// Implementation of the peripherals module.
 ///
@@ -9,6 +10,17 @@ use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
 use crate::{pilot::Pilot, adc::Adc};
 
 use log::{info, warn, error, debug, trace};
+
+#[derive(Debug)]
+pub struct PeripheralsError;
+
+impl Display for PeripheralsError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "PeripheralsError")
+    }
+}
+
+impl Context for PeripheralsError {}
 
 /// ## GPIO Pin Configuration
 /// Please note the following descriptions refer to GPIO numbers, not actual pin numbers on the Raspberry Pi GPIO connector:
@@ -47,6 +59,7 @@ pub struct GpioPeripherals {
 }
 
 impl GpioPeripherals {
+    #[must_use]
     pub fn new() -> Self {
         // TODO: unwraps
         let gpio = Gpio::new().unwrap();
@@ -93,30 +106,44 @@ impl GpioPeripherals {
         self.power_watchdog.store(state, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn set_pilot_ampere(&mut self, ampere: f32) {
+    pub fn set_pilot_ampere(&mut self, ampere: f32) -> Result<(), PeripheralsError> {
         let duty_cycle = ampere / 100.0; // This is wrong: TODO: fix
-        self.pilot.set_duty_cycle(duty_cycle as f64);
+        self.pilot.set_duty_cycle(duty_cycle as f64).change_context(PeripheralsError)
     }
 
     fn power_pin_thread(mut wdp: OutputPin, watch_dog: Arc<AtomicBool>) {
-        let tick = crossbeam_channel::tick(std::time::Duration::from_micros(500));
         let mut state = Level::Low;
         thread::spawn(move || {
+            let mut i = 0;
+            let mut state_changes = 0;
+            let mut last = std::time::Instant::now();
             loop {
-                tick.recv().unwrap();
                 let togle = watch_dog.load(std::sync::atomic::Ordering::Relaxed);
+                thread::sleep(Duration::from_micros(900));
                 if togle {
                     state = match state {
                         Level::Low => Level::High,
                         Level::High => Level::Low,
                     };
                     wdp.write(state);
+                    state_changes += 1;
                 } else if state == Level::High {
                     wdp.write(Level::Low);
                 }
-                // TODO: Add frequency probe
+
+                if i % 1000 == 0 {
+                    let now = std::time::Instant::now();
+                    if now - last > std::time::Duration::from_millis(500) {
+                        debug!("power watchdog: toggles per second: {} (Hz)", state_changes as f32 / (now - last).as_secs_f32());
+                        state_changes = 0;
+                        last = now;
+                    }
+                    // TODO: Make sure the watchdog oscilates at around 1 kHz, otherwise raise an error
+                    i = 0;
+                }
             }
         });
+        thread::sleep(std::time::Duration::from_millis(500));
     }
 
     pub fn set_contactor_pin(&mut self, level: Level) {
@@ -208,7 +235,7 @@ mod testgpio {
     #[test]
     fn test_set_pilot_ampere() {
         let mut gpio = GPIO.lock().unwrap();
-        gpio.set_pilot_ampere(32.0);
+        gpio.set_pilot_ampere(32.0).unwrap();
     }
 
 }

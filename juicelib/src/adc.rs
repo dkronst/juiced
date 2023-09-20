@@ -107,7 +107,7 @@ impl Adc {
     #[inline]
     pub fn peak_to_peak_pilot(&self) -> Result<(f32, f32), AdcError> {
         // TODO: fix so that the voltage is corrected for the voltage divider
-        let (min, max) = self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(15))?; // 10 cycles?
+        let (min, max) = self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(25))?; // 10 cycles?
         Ok((Self::from_vdiv_to_pilot(min), Self::from_vdiv_to_pilot(max)))
     }
 

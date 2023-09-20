@@ -4,9 +4,9 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{error::Error, thread, sync::{PoisonError}, f32::consts::E, time::Duration};
+use std::{thread, time::Duration};
 
-use rppal::gpio::{Level, Gpio, Trigger};
+use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
 
 use error_stack::{Context, Report, Result, ResultExt};
@@ -186,7 +186,7 @@ fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32
             {
                 (min, max) = adc.lock().unwrap().peak_to_peak_pilot().unwrap();
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(200));
             match pilot_tx.send((min, max)) {
                 Err(_) => {
                     error!("Pilot channel closed");
@@ -208,7 +208,7 @@ fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, H
     locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge).or_else(|e| {
         Err(Report::new(e).change_context(HwError::GpioError)).attach_printable("failed setting interrupt on GFI status pin")
     })?;
-    let res = locked_pins.gfi_status_pin.set_async_interrupt(
+    locked_pins.gfi_status_pin.set_async_interrupt(
         Trigger::RisingEdge,
         move |_| {
             warn!("GFI Interrupted");
@@ -274,12 +274,18 @@ impl EVSEHardwareImpl {
 
     fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
         self.contactor = state.clone();
-        self.hw_peripherals.set_contactor_pin(state.into());
+        self.hw_peripherals.set_contactor_pin(state.clone().into());
+        self.hw_peripherals.set_power_watchdog(
+            match state {
+                OnOff::On => Level::Low,
+                OnOff::Off => Level::High,
+            }
+        );
         Ok(())
     }
 
     fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
-        self.hw_peripherals.set_pilot_ampere(ampere);
+        self.hw_peripherals.set_pilot_ampere(ampere).change_context(HwError::GpioError).attach_printable("set current offer failed")?;
         self.current_offer = ampere;
         Ok(())
     }
@@ -303,7 +309,7 @@ impl EVSEHardware for EVSEHardwareImpl {
     }
 
     fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
-        self.hw_peripherals.set_pilot_ampere(ampere);
+        self.hw_peripherals.set_pilot_ampere(ampere).change_context(HwError::HardwareFault)?;
         self.current_offer = ampere;
         Ok(())
     }
@@ -330,14 +336,14 @@ where T: EVSEHardware
     match state {
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
-            hw.set_current_offer_ampere(10.0)?;
+            hw.set_current_offer_ampere(1.0)?;
             hw.set_ground_test_pin(OnOff::Off)?;
         },
         EVSEMachineState::VehicleDetected => {
             hw.set_contactor(OnOff::Off)?;
             hw.set_current_offer_ampere(T::MAX_CURRENT_OFFER)?;
             hw.set_ground_test_pin(OnOff::On)?;
-        },        
+        },
         EVSEMachineState::Charging => {
             let state = hw.get_contactor_state()?;
             if let OnOff::Off = state {
@@ -396,7 +402,7 @@ where T: EVSEHardware + Send + Sync
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
                 
-                evse.set_current_offer_ampere(10.0).unwrap();
+                evse.set_current_offer_ampere(1.0).unwrap();
                 let res = do_state_transition(state, &mut evse);
                 let mut state_input = EVSEMachineInput::PilotInError;
                 if let Err(e) = res {
