@@ -1,6 +1,6 @@
 use std::{sync::{atomic::AtomicBool, Arc, Mutex}, thread, time::Duration, fmt::{Display, Formatter, self}};
 
-use error_stack::{Context, ResultExt, Result};
+use error_stack::{Context, ResultExt, Result, Report};
 ///
 /// Implementation of the peripherals module.
 ///
@@ -153,6 +153,16 @@ impl GpioPeripherals {
     pub fn set_contactor_pin(&mut self, level: Level) {
         let mut pins = self.pins.lock().unwrap();
         pins.contactor_pin.write(level);
+    }
+
+    pub fn reset_gfi_status_pin(&mut self) -> Result<(), PeripheralsError> {
+        let mut pins = self.pins.lock().unwrap();
+        pins.gfi_status_pin.clear_interrupt().change_context(PeripheralsError)?;
+        pins.gfi_status_pin.clear_async_interrupt().change_context(PeripheralsError)?;
+        match pins.gfi_status_pin.read() {
+            Level::High => Err(Report::new(PeripheralsError)),
+            Level::Low => Ok(()),
+        }
     }
 
     pub fn read_gfi_status_pin(&self) -> Level {

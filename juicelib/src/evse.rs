@@ -15,11 +15,10 @@ use log::{info, warn, error, debug};
 
 use crossbeam_channel::{Receiver, Select, bounded};
 
-use crate::peripherals::GpioPeripherals;
+use crate::peripherals::{GpioPeripherals, PeripheralsError};
 
-
-
-
+const MAINS_FREQUENCY_HZ: f64 = 50.; // Hz
+const GFI_TEST_CYCLE: u64 = 10; // 10 cycles
 
 // The states are summed up in the following table:
 // 3. **The Different states** as defined by the SAE_J1772 std:
@@ -65,7 +64,6 @@ state_machine! {
         NoGround => FailedStation [NoGroundError],
         HardwareFault => FailedStation [HardwareFault],
     },
-    
     Charging => {
         PilotIs12V => ResetableError [VehicleDisconnected],
         PilotIs9V => VehicleDetected [ChargingFinished],
@@ -90,8 +88,32 @@ state_machine! {
 // The point here is to prevent safety issues by having a state machine
 // fail and crash when inside a different thread - thus not disconnecting.
 
-fn run_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, HwError> {
+fn run_gfi_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, HwError> {
     evse.set_waiting_for_vehicle()?;
+    evse.set_ground_test_pin(OnOff::Off)?;
+    evse.reset_gfi_status_pin()?;
+
+    evse.set_ground_test_pin(OnOff::On)?;
+    thread::sleep(Duration::from_millis((GFI_TEST_CYCLE as f64 * MAINS_FREQUENCY_HZ) as u64)); // Wait for the required number of cycles
+    if evse.get_gfi_status_pin() == Level::Low {
+        return Ok(EVSEMachineInput::SelfTestFailed);
+    }
+    evse.set_ground_test_pin(OnOff::Off)?;
+
+    thread::sleep(Duration::from_millis(100));
+    evse.reset_gfi_status_pin()?;
+    thread::sleep(Duration::from_millis(100));
+    if evse.get_gfi_status_pin() != Level::Low {
+        return Ok(EVSEMachineInput::SelfTestFailed);
+    }
+    thread::sleep(Duration::from_millis(100));
+    if evse.get_gfi_status_pin() != Level::Low {
+        return Ok(EVSEMachineInput::SelfTestFailed);
+    }
+
+    evse.reset_gfi_status_pin()?;
+
+
     Ok(EVSEMachineInput::SelfTestOk)
 }
 
@@ -236,6 +258,15 @@ pub trait EVSEHardware {
     fn get_contactor_state(&mut self) -> Result<OnOff, HwError>;
     fn get_peripherals(&mut self) -> &mut GpioPeripherals;
 
+    fn get_gfi_status_pin(&mut self) -> Level {
+        self.get_peripherals().read_gfi_status_pin()
+    }
+
+    fn reset_gfi_status_pin(&mut self) -> Result<(), HwError> {
+        self.get_peripherals().reset_gfi_status_pin().change_context(HwError::HardwareFault)?;
+        Ok(())
+    }
+
     fn set_waiting_for_vehicle(&mut self) -> Result<(), HwError> {
         debug!("Setting waiting for vehicle");
         self.set_contactor(OnOff::Off)?;
@@ -353,8 +384,16 @@ where T: EVSEHardware
         EVSEMachineState::Charging => {
             let state = hw.get_contactor_state()?;
             if OnOff::Off != state {
-                info!("Contactor is off. Turning it on");
-                hw.set_contactor(OnOff::On)?;
+                info!("Contactor is off. Running GFI self test.");
+                let self_test_result = run_gfi_self_test(hw)?;
+                match self_test_result {
+                    EVSEMachineInput::SelfTestFailed => {
+                        return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed before power on"));
+                    },
+                    _ => {
+                        hw.set_contactor(OnOff::On)?;
+                    }
+                }
             }
         },
         EVSEMachineState::NoPower => {
@@ -383,7 +422,7 @@ where T: EVSEHardware + Send + Sync
         match machine.state() {
             EVSEMachineState::SelfTest => {
                 // Do the self test
-                let self_test_result = run_self_test(&mut evse).unwrap();
+                let self_test_result = run_gfi_self_test(&mut evse).unwrap();
                 let output = machine.consume(&self_test_result).unwrap();
                 debug!("Output: {:?}", output.unwrap());
                 debug!("State: {:?}", machine.state());
