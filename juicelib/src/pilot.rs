@@ -46,7 +46,7 @@ impl Pilot {
         if self.duty_cycle == duty_cycle {
             return Ok(());
         }
-        self.pwm.set_duty_cycle(0.).change_context(PilotError::PwmError)?;
+        self.pwm.set_duty_cycle(duty_cycle).change_context(PilotError::PwmError)?;
         self.duty_cycle = duty_cycle;
 
         Ok(())

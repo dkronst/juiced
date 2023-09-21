@@ -111,6 +111,10 @@ impl GpioPeripherals {
         self.pilot.set_duty_cycle(duty_cycle as f64).change_context(PeripheralsError)
     }
 
+    pub fn set_waiting_for_vehicle(&mut self) -> Result<(), PeripheralsError> {
+        self.pilot.set_to_waiting_for_vehicle().change_context(PeripheralsError)
+    }
+
     fn power_pin_thread(mut wdp: OutputPin, watch_dog: Arc<AtomicBool>) {
         let mut state = Level::Low;
         thread::spawn(move || {
