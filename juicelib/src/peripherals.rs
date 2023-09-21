@@ -107,7 +107,7 @@ impl GpioPeripherals {
     }
 
     pub fn set_pilot_ampere(&mut self, ampere: f32) -> Result<(), PeripheralsError> {
-        let duty_cycle = ampere / 100.0; // This is wrong: TODO: fix
+        let duty_cycle = ampere / 0.6; // Based on: https://www.fveaa.org/fb/J1772_386.pdf
         self.pilot.set_duty_cycle(duty_cycle as f64).change_context(PeripheralsError)
     }
 
@@ -133,7 +133,7 @@ impl GpioPeripherals {
 
                 if i % 1000 == 0 {
                     let now = std::time::Instant::now();
-                    if now - last > std::time::Duration::from_millis(500) {
+                    if now - last > std::time::Duration::from_millis(2000) && togle {
                         debug!("power watchdog: toggles per second: {} (Hz)", state_changes as f32 / (now - last).as_secs_f32());
                         state_changes = 0;
                         last = now;
@@ -147,11 +147,8 @@ impl GpioPeripherals {
     }
 
     pub fn set_contactor_pin(&mut self, level: Level) {
-        info!("locking pins");
         let mut pins = self.pins.lock().unwrap();
-        info!("pins locked");
         pins.contactor_pin.write(level);
-        info!("done locking pins");
     }
 
     pub fn read_gfi_status_pin(&self) -> Level {

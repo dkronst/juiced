@@ -53,12 +53,13 @@ state_machine! {
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
         HardwareFault => FailedStation [HardwareFault],
+        PilotIsNegative12V => FailedStation [HardwareFault],
     },
     VehicleDetected => {
         PilotIs12V => Standby [VehicleDisconnected],
         PilotIs6V => Charging [ChargingInProgress],
         PilotIs3V => VentilationNeeded,
-        PilotIs0V => NoPower,
+        PilotIsNegative12V => NoPower,
         PilotInError => ResetableError [PilotMeasurement],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
@@ -70,11 +71,12 @@ state_machine! {
         PilotIs9V => VehicleDetected [ChargingFinished],
         PilotIs6V => Charging [ChargingInProgress], // Is this correct?
         PilotIs3V => VentilationNeeded [UnsupportedVehicle],
-        PilotIs0V => NoPower [ChargingFinished],
+        PilotIsNegative12V => NoPower [ChargingFinished],
         PilotInError => ResetableError [PilotMeasurement],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
         HardwareFault => FailedStation [HardwareFault],
+        NoTransition => Charging [NoTransition],
     },
     ResetableError => {
         PilotIs12V => Standby,    // This error can be reset by the user
@@ -86,7 +88,7 @@ state_machine! {
 // The point here is to prevent safety issues by having a state machine
 // fail and crash when inside a different thread - thus not disconnecting.
 
-fn run_self_test() -> EVSEMachineInput {
+fn run_self_test(evse: &mut impl EVSEHardware) -> EVSEMachineInput {
     EVSEMachineInput::SelfTestOk
 }
 
@@ -110,8 +112,8 @@ fn get_pilot_state(min_max: (f32, f32)) -> EVSEMachineInput {
         EVSEMachineInput::PilotIs6V
     } else if 4.0 > voltage && voltage > 2.0 {
         EVSEMachineInput::PilotIs3V
-    } else if 1.0 > voltage && voltage > -1.0 {
-        EVSEMachineInput::PilotIs0V
+    } else if -11.0 > voltage && voltage > -13.0 {
+        EVSEMachineInput::PilotIsNegative12V
     } else {
         info!("Pilot voltage is out of range: {}", voltage);
         EVSEMachineInput::PilotInError
@@ -230,6 +232,13 @@ pub trait EVSEHardware {
     fn get_contactor_state(&mut self) -> Result<OnOff, HwError>;
     fn get_peripherals(&mut self) -> &mut GpioPeripherals;
 
+    fn set_waiting_for_vehicle(&mut self) -> Result<(), HwError> {
+        self.set_contactor(OnOff::Off)?;
+        self.set_current_offer_ampere(9999.)?;  // Set the line to +12V to detect the vehicle if present
+        self.set_ground_test_pin(OnOff::Off)?;
+        Ok(())
+    }
+
     const MAX_CURRENT_OFFER: f32 = 32.0;
 }
 
@@ -332,11 +341,11 @@ impl EVSEHardware for EVSEHardwareImpl {
 fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T) -> Result<(), HwError> 
 where T: EVSEHardware
 {
-    info!("Do state transition: {:?}", state);
+    debug!("Do state transition: {:?}", state);
     match state {
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
-            hw.set_current_offer_ampere(1.0)?;
+            hw.set_waiting_for_vehicle()?;
             hw.set_ground_test_pin(OnOff::Off)?;
         },
         EVSEMachineState::VehicleDetected => {
@@ -372,10 +381,10 @@ where T: EVSEHardware + Send + Sync
         match machine.state() {
             EVSEMachineState::SelfTest => {
                 // Do the self test
-                let self_test_result = run_self_test(); // TODO: What's needed here?
+                let self_test_result = run_self_test(&mut evse); // TODO: What's needed here?
                 let output = machine.consume(&self_test_result).unwrap();
-                info!("Output: {:?}", output.unwrap());
-                info!("State: {:?}", machine.state());
+                debug!("Output: {:?}", output.unwrap());
+                debug!("State: {:?}", machine.state());
             },
             EVSEMachineState::ResetableError => {
                 // todo!("Reset the error");
@@ -401,8 +410,6 @@ where T: EVSEHardware + Send + Sync
                 // We will decide on a pilot error, or we'll get one from the channel if 
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
-                
-                evse.set_current_offer_ampere(1.0).unwrap();
                 let res = do_state_transition(state, &mut evse);
                 let mut state_input = EVSEMachineInput::PilotInError;
                 if let Err(e) = res {
@@ -416,10 +423,10 @@ where T: EVSEHardware + Send + Sync
                 } else {
                     state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
                 }
-                info!("State input: {:?}", state_input);                
+                debug!("State input: {:?}", state_input);                
                 let output = machine.consume(&state_input);
-                info!("Output: {:?}", output);
-                info!("State: {:?}", machine.state());
+                debug!("Output: {:?}", output);
+                debug!("State: {:?}", machine.state());
             }
         }
     }

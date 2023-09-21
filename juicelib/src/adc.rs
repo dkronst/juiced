@@ -61,7 +61,7 @@ impl Adc {
     const PILOT_VOLTAGE_CHANNEL: u8 = 0;
     const CURRENT_SENSE_CHANNEL: u8 = 1;
     const AC_VOLTAGE_CHANNEL:    u8 = 2;
-    const SPI_FREQUENCY:        u32 = 300_000;  // Tested empirically, 300kHz is the fastest that works linearly.
+    const SPI_FREQUENCY:        u32 = 200_000;  // Tested empirically, 300kHz is the fastest that works linearly.
     const SPI_MODE:            Mode = Mode::Mode0;
     const SPI_BUS:              Bus = Bus::Spi0;
     const SPI_SLAVE_SELECT: SlaveSelect = SlaveSelect::Ss0;
@@ -107,7 +107,7 @@ impl Adc {
     #[inline]
     pub fn peak_to_peak_pilot(&self) -> Result<(f32, f32), AdcError> {
         // TODO: fix so that the voltage is corrected for the voltage divider
-        let (min, max) = self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(25))?; // 10 cycles?
+        let (min, max) = self.peak_to_peak(Self::PILOT_VOLTAGE_CHANNEL, Duration::from_millis(50))?; // 10 cycles?
         Ok((Self::from_vdiv_to_pilot(min), Self::from_vdiv_to_pilot(max)))
     }
 

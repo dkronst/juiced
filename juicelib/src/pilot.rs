@@ -1,11 +1,12 @@
 use std::{time::Duration, fmt::{Display, Formatter, self}};
 use error_stack::{ResultExt, Context, Result};
-use rppal::{pwm::{Pwm, Channel}, gpio::{Gpio, Level}};
+use rppal::{pwm::{Pwm, Channel, Polarity}, gpio::{Gpio, Level}};
 
 use log::{info, warn, error, debug, trace};
 
 pub struct Pilot {
     pwm: Pwm,
+    duty_cycle: f64,
 }
 
 #[derive(Debug)]
@@ -25,13 +26,11 @@ impl Display for PilotError {
 
 impl Pilot {
     pub fn new() -> Result<Self, PilotError> {
-        let pwm = Pwm::new(Channel::Pwm0).change_context(PilotError::PwmError)?;
-        pwm.set_period(Duration::from_millis(1)).change_context(PilotError::PwmError)?; // 1KHz 
-        pwm.enable().change_context(PilotError::PwmError)?;
-        pwm.set_duty_cycle(1 as f64).change_context(PilotError::PwmError)?;
+        let pwm = Pwm::with_period(Channel::Pwm0, Duration::from_millis(1), Duration::from_millis(1), Polarity::Normal, true).change_context(PilotError::PwmError)?;
 
         Ok(Self {
             pwm,
+            duty_cycle: 1.0,
         })
     }
 
@@ -44,8 +43,11 @@ impl Pilot {
     }
 
     pub fn set_duty_cycle(&mut self, duty_cycle: f64) -> Result<(), PilotError> {
-
-        self.pwm.set_duty_cycle(duty_cycle).change_context(PilotError::PwmError)?;
+        if self.duty_cycle == duty_cycle {
+            return Ok(());
+        }
+        self.pwm.set_duty_cycle(0.).change_context(PilotError::PwmError)?;
+        self.duty_cycle = duty_cycle;
 
         Ok(())
     }
