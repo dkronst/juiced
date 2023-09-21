@@ -96,7 +96,7 @@ fn run_gfi_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, H
     evse.set_ground_test_pin(OnOff::On)?;
     thread::sleep(Duration::from_millis((GFI_TEST_CYCLE as f64 * MAINS_FREQUENCY_HZ) as u64)); // Wait for the required number of cycles
     if evse.get_gfi_status_pin() == Level::Low {
-        return Ok(EVSEMachineInput::SelfTestFailed);
+        return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: mock ground fault not detected."))?;
     }
     evse.set_ground_test_pin(OnOff::Off)?;
 
@@ -104,11 +104,11 @@ fn run_gfi_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, H
     evse.reset_gfi_status_pin()?;
     thread::sleep(Duration::from_millis(100));
     if evse.get_gfi_status_pin() != Level::Low {
-        return Ok(EVSEMachineInput::SelfTestFailed);
+        return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: mock ground fault was not cleared."))?;
     }
     thread::sleep(Duration::from_millis(100));
     if evse.get_gfi_status_pin() != Level::Low {
-        return Ok(EVSEMachineInput::SelfTestFailed);
+        return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: mock ground fault is high after clearning."))?;
     }
 
     evse.reset_gfi_status_pin()?;
@@ -419,13 +419,25 @@ where T: EVSEHardware + Send + Sync
     let fault_chan = start_fault_thread(evse.get_peripherals()).unwrap();
 
     loop {
+        let mut state_input = EVSEMachineInput::PilotInError;
         match machine.state() {
             EVSEMachineState::SelfTest => {
                 // Do the self test
-                let self_test_result = run_gfi_self_test(&mut evse).unwrap();
-                let output = machine.consume(&self_test_result).unwrap();
-                debug!("Output: {:?}", output.unwrap());
-                debug!("State: {:?}", machine.state());
+                let self_test_result = run_gfi_self_test(&mut evse);
+                match self_test_result {
+                    Err(e) => {
+                        state_input = EVSEMachineInput::SelfTestFailed;
+                        error!("Self test failed: {:?}", e);
+                    },
+                    Ok(EVSEMachineInput::SelfTestOk) => {
+                        state_input = EVSEMachineInput::SelfTestOk;
+                        info!("Self test passed");
+                    },
+                    Ok(e) => {
+                        error!("Self test returned an unexpected result: {:?}", e);
+                        state_input = e;
+                    }
+                }
             },
             EVSEMachineState::ResetableError => {
                 // todo!("Reset the error");
@@ -452,25 +464,27 @@ where T: EVSEHardware + Send + Sync
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
                 let res = do_state_transition(state, &mut evse);
-                let mut state_input = EVSEMachineInput::PilotInError;
-                if let Err(e) = res {
-                    error!("Error: {}", e);
-                    state_input = EVSEMachineInput::HardwareFault;
-                    // Turn off the contactor, if we fail, we'll try again in the state transition
-                    // This is anyway only a secondary safety measure, since the hardware is already hard-wired
-                    // to turn off the contactor immediately if a something dangerous happens (no software), 
-                    // such as GFI for example.
-                    evse.set_contactor(OnOff::Off).unwrap_or(());     
-                } else {
-                    state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
+                match res {
+                    Err(e) => {
+                        error!("Error: {:?}", e);
+                        state_input = EVSEMachineInput::HardwareFault;
+                        // Turn off the contactor, if we fail, we'll try again in the state transition
+                        // This is anyway only a secondary safety measure, since the hardware is already hard-wired
+                        // to turn off the contactor immediately if a something dangerous happens (no software), 
+                        // such as GFI for example.
+                        evse.set_contactor(OnOff::Off).unwrap_or(());     
+                    },
+                    _ => {
+                        state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
+                    }
                 }
-                debug!("State input: {:?}", state_input);                
-                let output = machine.consume(&state_input);
-                debug!("Output: {:?}", output);
-                debug!("State: {:?}", machine.state());
             }
         }
-    }
+        debug!("State input: {:?}", state_input);                
+        let output = machine.consume(&state_input);
+        debug!("Output: {:?}", output);
+        debug!("State: {:?}", machine.state());
+    } // loop
 }
 
 #[cfg(test)]
