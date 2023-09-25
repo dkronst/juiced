@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Select, bounded};
 use crate::peripherals::{GpioPeripherals, PeripheralsError};
 
 const MAINS_FREQUENCY_HZ: f64 = 50.; // Hz
-const GFI_TEST_CYCLE: u64 = 10; // 10 cycles
+const GFI_TEST_CYCLES: u64 = 10; // 10 cycles
 
 // The states are summed up in the following table:
 // 3. **The Different states** as defined by the SAE_J1772 std:
@@ -89,19 +89,30 @@ state_machine! {
 // fail and crash when inside a different thread - thus not disconnecting.
 
 fn run_gfi_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, HwError> {
-    evse.set_waiting_for_vehicle()?;
     evse.set_ground_test_pin(OnOff::Off)?;
-    evse.reset_gfi_status_pin()?;
-
-    evse.set_ground_test_pin(OnOff::On)?;
-    thread::sleep(Duration::from_millis((GFI_TEST_CYCLE as f64 * MAINS_FREQUENCY_HZ) as u64)); // Wait for the required number of cycles
+    evse.set_contactor(OnOff::Off)?;
+    thread::sleep(Duration::from_millis(200));
+    evse.gfi_reset()?;
+    thread::sleep(Duration::from_millis(100));
+    evse.reset_gfi_status_pin()?;   // Reset the interrupt handler and clear the pin
+    debug!("GFI Status before self test: {:?}", evse.get_gfi_status_pin());
+    if evse.get_gfi_status_pin() != Level::Low {
+        return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: GFI status pin is high before synthetic interrupt."))?;
+    }
+    
+    for _ in 0..GFI_TEST_CYCLES {
+        evse.set_ground_test_pin(OnOff::On)?;
+        thread::sleep(Duration::from_secs_f64(1./(2.*MAINS_FREQUENCY_HZ))); // Wait for the required number of cycles
+        evse.set_ground_test_pin(OnOff::Off)?;
+        thread::sleep(Duration::from_secs_f64(1./(2.*MAINS_FREQUENCY_HZ))); // Wait for the required number of cycles
+    }
     if evse.get_gfi_status_pin() == Level::Low {
         return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: mock ground fault not detected."))?;
     }
-    evse.set_ground_test_pin(OnOff::Off)?;
-
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(300));
+    evse.gfi_reset()?;
     evse.reset_gfi_status_pin()?;
+
     thread::sleep(Duration::from_millis(100));
     if evse.get_gfi_status_pin() != Level::Low {
         return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: mock ground fault was not cleared."))?;
@@ -262,6 +273,11 @@ pub trait EVSEHardware {
         self.get_peripherals().read_gfi_status_pin()
     }
 
+    fn gfi_reset(&mut self) -> Result<(), HwError> {
+        self.get_peripherals().gfi_reset().change_context(HwError::HardwareFault)?;
+        Ok(())
+    }
+
     fn reset_gfi_status_pin(&mut self) -> Result<(), HwError> {
         self.get_peripherals().reset_gfi_status_pin().change_context(HwError::HardwareFault)?;
         Ok(())
@@ -336,8 +352,8 @@ impl EVSEHardware for EVSEHardwareImpl {
         self.hw_peripherals.set_contactor_pin(state.clone().into());
         self.hw_peripherals.set_power_watchdog(
             match state {
-                OnOff::On => Level::Low,
-                OnOff::Off => Level::High,
+                OnOff::On => Level::High,
+                OnOff::Off => Level::Low,
             }
         );
         Ok(())

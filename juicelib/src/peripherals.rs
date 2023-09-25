@@ -25,13 +25,13 @@ impl Context for PeripheralsError {}
 /// ## GPIO Pin Configuration
 /// Please note the following descriptions refer to GPIO numbers, not actual pin numbers on the Raspberry Pi GPIO connector:
 
-/// - `4` - Power Watchdog Pin: Toggle this pin at 1-10 kHz whenever the relay is powered on. (using the pilot.rs module)
+/// - `4` - Power Watchdog Pin: Toggle this pin at 1-10 kHz whenever the relay is powered on.
 /// - `17` - Power Pin: Set this pin high to turn on the vehicle power. Ensure the power watchdog pin is toggling, else a synthetic GFI event will occur.
 /// - `18` - Pilot Pin: Set this pin high for +12, low for -12. Further details on using this pin are discussed below.
 /// - `22` - GFI Status Pin: This input pin goes high when the GFI is set, preventing the power from being turned on.
 /// - `23` - Relay Test Pin: This input pin provides the status of the HV relay / GCM test. It should go high and remain that way within 100 ms of turning the power on. Similarly, it should go low and remain so within 100 ms of turning the power off.
 /// - `24` - GFI Test Pin: This output pin is connected to a wire taking two loops through the GFI CT, then connecting to the ground. Toggle this pin at 60 Hz to simulate a ground fault as part of the GFI test procedure.
-///i - `27` - GFI Reset Pin: Pulse this pin high to clear the GFI. This action cannot be performed while vehicle power is on.
+/// - `27` - GFI Reset Pin: Pulse this pin high to clear the GFI. This action cannot be performed while vehicle power is on.
 
 // define the GPIO pins
 
@@ -65,12 +65,18 @@ impl GpioPeripherals {
         let gpio = Gpio::new().unwrap();
 
         let pilot = Pilot::new().unwrap();
-        let power_watchdog_pin = gpio.get(POWER_WATCHDOG_PIN).unwrap().into_output();
-        let contactor_pin = gpio.get(CONTACTOR_PIN).unwrap().into_output();
+        let mut power_watchdog_pin = gpio.get(POWER_WATCHDOG_PIN).unwrap().into_output();
+        let mut contactor_pin = gpio.get(CONTACTOR_PIN).unwrap().into_output();
         let gfi_status_pin = gpio.get(GFI_STATUS_PIN).unwrap().into_input();
         let relay_test_pin = gpio.get(RELAY_TEST_PIN).unwrap().into_input();
-        let gfi_test_pin = gpio.get(GFI_TEST_PIN).unwrap().into_output();
-        let gfi_reset_pin = gpio.get(GFI_RESET_PIN).unwrap().into_output();
+        let mut gfi_test_pin = gpio.get(GFI_TEST_PIN).unwrap().into_output();
+        let mut gfi_reset_pin = gpio.get(GFI_RESET_PIN).unwrap().into_output();
+
+        power_watchdog_pin.set_low();
+        contactor_pin.set_low();
+        gfi_test_pin.set_low();
+        gfi_reset_pin.set_low();
+
 
         let power_watchdog = Arc::new(AtomicBool::new(false));
 
@@ -116,7 +122,9 @@ impl GpioPeripherals {
     }
 
     fn power_pin_thread(mut wdp: OutputPin, watch_dog: Arc<AtomicBool>) {
-        let mut state = Level::Low;
+        let mut state = Level::High;
+        
+        wdp.set_low();
         thread::spawn(move || {
             let mut i = 0;
             let mut state_changes = 0;
@@ -181,16 +189,18 @@ impl GpioPeripherals {
     }
 
     pub fn set_gfi_test_pin(&mut self, level: Level) {
-        // TODO: Oscillate at 50 Hz
         let mut pins = self.pins.lock().unwrap();
         pins.gfi_test_pin.write(level);
     }
 
-    pub fn gfi_reset(&mut self) {
+    pub fn gfi_reset(&mut self) -> Result<(), PeripheralsError> {
+        debug!("Resetting GFI");
         let mut pins = self.pins.lock().unwrap();
-        pins.gfi_reset_pin.write(Level::High);
+        pins.gfi_reset_pin.set_high();
         thread::sleep(std::time::Duration::from_millis(100));
-        pins.gfi_reset_pin.write(Level::Low);
+        pins.gfi_reset_pin.set_low();
+        thread::sleep(std::time::Duration::from_millis(100));
+        Ok(())
     }
 }
 
