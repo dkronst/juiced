@@ -4,7 +4,7 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar}};
 
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
@@ -42,11 +42,12 @@ state_machine! {
 
     SelfTest => {
         SelfTestOk => Standby [SelfTestOk],
-        SelfTestFailed => FailedStation [SelfTestError]
+        SelfTestFailed => FailedStation [SelfTestError],
+        HardwareFault => FailedStation [HardwareFault],
     },
     Standby => {
-        PilotIs12V => Standby [VehicleNotDetected],
-        PilotIs9V => VehicleDetected [StartCharging],
+        PilotIs12V => Standby [NoTransition],
+        PilotIs9V => VehicleDetected [ConsiderCharging],
         PilotIs6V => ResetableError[Illegal],
         PilotIs3V => ResetableError[Illegal],
         GFIInterrupted => FailedStation [GFIError],
@@ -56,7 +57,8 @@ state_machine! {
     },
     VehicleDetected => {
         PilotIs12V => Standby [VehicleDisconnected],
-        PilotIs6V => Charging [ChargingInProgress],
+        PilotIs9V => VehicleDetected [NoTransition],
+        PilotIs6V => Charging [OfferCharging],
         PilotIs3V => VentilationNeeded,
         PilotIsNegative12V => NoPower,
         PilotInError => ResetableError [PilotMeasurement],
@@ -67,7 +69,7 @@ state_machine! {
     Charging => {
         PilotIs12V => ResetableError [VehicleDisconnected],
         PilotIs9V => VehicleDetected [ChargingFinished],
-        PilotIs6V => Charging [ChargingInProgress], // Is this correct?
+        PilotIs6V => Charging [NoTransition],
         PilotIs3V => VentilationNeeded [UnsupportedVehicle],
         PilotIsNegative12V => NoPower [ChargingFinished],
         PilotInError => ResetableError [PilotMeasurement],
@@ -77,6 +79,7 @@ state_machine! {
     },
     NoPower => {
         PilotIsNegative12V => NoPower [ChargingFinished],
+        HardwareFault => FailedStation [HardwareFault],
     },
     ResetableError => {
         PilotIs12V => Standby,    // This error can be reset by the user
@@ -109,7 +112,7 @@ fn run_gfi_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, H
     if evse.get_gfi_status_pin() == Level::Low {
         return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed: mock ground fault not detected."))?;
     }
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(500));
     evse.gfi_reset()?;
     evse.reset_gfi_status_pin()?;
 
@@ -133,6 +136,7 @@ pub enum Fault {
     GFIInterrupted,
     NoGround,
     PilotInError,
+    InternalFaultThreadError,
 }
 
 fn get_pilot_state(min_max: (f32, f32)) -> EVSEMachineInput {
@@ -183,6 +187,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
                         Fault::GFIInterrupted => EVSEMachineInput::GFIInterrupted,
                         Fault::NoGround => EVSEMachineInput::NoGround,
                         Fault::PilotInError => EVSEMachineInput::PilotInError,
+                        Fault::InternalFaultThreadError => EVSEMachineInput::HardwareFault,
                     }
                 },
                 Err(_) => {
@@ -207,7 +212,8 @@ pub enum OnOff {
 pub enum HwError {
     PoisonError,
     GpioError,
-    HardwareFault
+    HardwareFault,
+    InternalFaultThreadError,
 }
 
 impl Context for HwError {}
@@ -246,22 +252,40 @@ fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, H
     // TODO: This is wrong. fix to not lose the channel.
     let (fault_tx, fault_rx) = bounded(16);
     let pins = periph.get_pins();
+    
+    thread::spawn(move || {
+        let res = || -> Result<(), HwError> {
+            let cond = Arc::new(Condvar::new());
+            loop {
+                let fault_tx = fault_tx.clone();
+                let cond = Arc::clone(&cond);
+                {
+                    let mut locked_pins = pins.lock().
+                        map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
 
-    let mut locked_pins = pins.lock().
-        map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
-    locked_pins.gfi_status_pin.set_interrupt(Trigger::RisingEdge).or_else(|e| {
-        Err(Report::new(e).change_context(HwError::GpioError)).attach_printable("failed setting interrupt on GFI status pin")
-    })?;
-    locked_pins.gfi_status_pin.set_async_interrupt(
-        Trigger::RisingEdge,
-        move |_| {
-            warn!("GFI Interrupted");
-            fault_tx.send(Fault::GFIInterrupted).unwrap();
-            info!("GFI message sent to channel");
+                    let cond_clone = Arc::clone(&cond);
+                    locked_pins.gfi_status_pin.set_async_interrupt(Trigger::RisingEdge, move |_| {
+                        cond_clone.notify_all();
+                    }).change_context(HwError::GpioError)?;
+                    let locked_pins = cond.wait(locked_pins).map_err(
+                        |e| Report::new(HwError::PoisonError).attach_printable(format!("failed waiting on condvar: {:?}", e))
+                    )?;
+                    let gfi_status = locked_pins.gfi_status_pin.is_high();
+                    let contactor = locked_pins.contactor_pin.is_set_high();
+                    if gfi_status && contactor {
+                        fault_tx.send(Fault::GFIInterrupted)
+                            .map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed sending fault: {:?}", e)))?;
+                    } else if !contactor {
+                        debug!("GFI Interrupted, but contactor is off. Ignoring.");
+                    }
+                }
+            }
+        }();
+        if let Err(e) = res {
+            error!("Error: {:?}", e);
+            fault_tx.send(Fault::InternalFaultThreadError).unwrap();
         }
-    ).map_err(|e| {
-        Report::new(e).change_context(HwError::GpioError).attach_printable("failed setting async interrupt on GFI status pin")
-    })?;
+    });
     
     Ok(fault_rx)
 }
@@ -338,12 +362,6 @@ impl EVSEHardwareImpl {
         ret
     }
 
-    fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
-        self.hw_peripherals.set_pilot_ampere(ampere).change_context(HwError::GpioError).attach_printable("set current offer failed")?;
-        self.current_offer = ampere;
-        Ok(())
-    }
-
     fn set_gfi_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
         self.ground_test_pin = state.clone();
         self.hw_peripherals.set_gfi_test_pin(state.into());
@@ -404,7 +422,8 @@ where T: EVSEHardware
         },
         EVSEMachineState::Charging => {
             let state = hw.get_contactor_state()?;
-            if OnOff::Off != state {
+            debug!("Machine is set to 'Charging'. Contactor state: {:?}", state);
+            if OnOff::Off == state {
                 info!("Contactor is off. Running GFI self test.");
                 let self_test_result = run_gfi_self_test(hw)?;
                 match self_test_result {
@@ -412,7 +431,9 @@ where T: EVSEHardware
                         return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed before power on"));
                     },
                     _ => {
+                        info!("Self test passed. Turning on contactor.");
                         hw.set_contactor(OnOff::On)?;
+                        thread::sleep(Duration::from_millis(200));
                     }
                 }
             }
@@ -496,7 +517,7 @@ where T: EVSEHardware + Send + Sync
                         // This is anyway only a secondary safety measure, since the hardware is already hard-wired
                         // to turn off the contactor immediately if a something dangerous happens (no software), 
                         // such as GFI for example.
-                        evse.set_contactor(OnOff::Off).unwrap_or(());     
+                        evse.set_contactor(OnOff::Off).unwrap_or(());
                     },
                     _ => {
                         state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());

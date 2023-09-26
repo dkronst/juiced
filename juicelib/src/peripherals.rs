@@ -113,7 +113,8 @@ impl GpioPeripherals {
     }
 
     pub fn set_pilot_ampere(&mut self, ampere: f32) -> Result<(), PeripheralsError> {
-        let duty_cycle = ampere / 0.6; // Based on: https://www.fveaa.org/fb/J1772_386.pdf
+        debug!("Setting pilot offer to {}A", ampere);
+        let duty_cycle = ampere / 0.6 / 100.; // Based on: https://www.fveaa.org/fb/J1772_386.pdf
         self.pilot.set_duty_cycle(duty_cycle as f64).change_context(PeripheralsError)
     }
 
