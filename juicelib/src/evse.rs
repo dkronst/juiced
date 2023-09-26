@@ -536,6 +536,7 @@ where T: EVSEHardware + Send + Sync
                         state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
                     }
                 }
+                debug!("Current sensor state: {:?}", sensor_state.read().unwrap());
             }
         }
         debug!("State input: {:?}", state_input);                

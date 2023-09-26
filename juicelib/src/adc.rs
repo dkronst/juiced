@@ -119,7 +119,7 @@ impl Adc {
         let mut zero_crossings = 0;
         
         let mut prev_reading = self.read_current_sense_one_sample()?;
-        while zero_crossings < 2 && count < 5000 {
+        while zero_crossings < 4 && count < 5000 {
             let reading = self.read_current_sense_one_sample()?;
             let diff = reading - prev_reading;
             if (diff > 0.0 && reading > 0.0) || (diff < 0.0 && reading < 0.0) {
@@ -165,10 +165,12 @@ impl Adc {
 
     /// Returns the peak voltage of the AC voltage.
     pub fn peak_mains_voltage(&self) -> Result<f32, AdcError> {
-        let (min, max) = self.peak_to_peak(Self::AC_VOLTAGE_CHANNEL, Duration::from_millis(1000/50))?;
-
-        let mains_peak = vec![min.abs(), max.abs()].iter().max_by(|x, y| x.partial_cmp(y).unwrap()).unwrap().abs();
-        
+        let (min, max) = self.peak_to_peak(Self::AC_VOLTAGE_CHANNEL, Duration::from_millis(2*1000/50))?;
+        let mains_peak = if min.abs() > max.abs() {
+            min
+        } else {
+            max
+        };        
         Ok(mains_peak)
     }
 }

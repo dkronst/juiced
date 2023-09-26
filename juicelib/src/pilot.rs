@@ -69,8 +69,6 @@ mod tests {
         let mut pilot = Pilot::new()?;
         pilot.set_to_waiting_for_vehicle()?;
         assert_eq!(pilot.pwm.duty_cycle().unwrap(), 1.0);
-        // TODO: Measure the PWM using an oscilloscope
-        // panic!("TODO: Measure the PWM using an oscilloscope");
         Ok(())
     }
 
