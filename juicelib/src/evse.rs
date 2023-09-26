@@ -4,7 +4,7 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{thread, time::Duration};
+use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
@@ -45,7 +45,7 @@ state_machine! {
         SelfTestFailed => FailedStation [SelfTestError]
     },
     Standby => {
-        PilotIs12V => Standby [VehicleDisconnected],
+        PilotIs12V => Standby [VehicleNotDetected],
         PilotIs9V => VehicleDetected [StartCharging],
         PilotIs6V => ResetableError[Illegal],
         PilotIs3V => ResetableError[Illegal],
@@ -128,6 +128,7 @@ fn run_gfi_self_test(evse: &mut impl EVSEHardware) -> Result<EVSEMachineInput, H
     Ok(EVSEMachineInput::SelfTestOk)
 }
 
+#[derive(Debug)]
 pub enum Fault {
     GFIInterrupted,
     NoGround,
@@ -177,6 +178,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
             // Fault channel
             match oper.recv(&fault_channel) {
                 Ok(fault) => {
+                    error!("Fault: {:?}", fault);
                     match fault {
                         Fault::GFIInterrupted => EVSEMachineInput::GFIInterrupted,
                         Fault::NoGround => EVSEMachineInput::NoGround,
@@ -216,7 +218,7 @@ impl std::fmt::Display for HwError {
     }
 }
 
-fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32)>, HwError> {
+fn start_pilot_thread(periph: &mut GpioPeripherals, listen_to_pilot: Arc<AtomicBool>) -> Result<Receiver<(f32, f32)>, HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
     thread::spawn(move || {
@@ -226,12 +228,14 @@ fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32
                 (min, max) = adc.lock().unwrap().peak_to_peak_pilot().unwrap();
             }
             thread::sleep(Duration::from_millis(200));
-            match pilot_tx.send((min, max)) {
-                Err(_) => {
-                    error!("Pilot channel closed");
-                    break;
-                },
-                _ => {}
+            if listen_to_pilot.load(Ordering::Relaxed) {
+                match pilot_tx.send((min, max)) {
+                    Err(_) => {
+                        error!("Pilot channel closed");
+                        break;
+                    },
+                    _ => {}
+                }
             }
         }
     });
@@ -239,6 +243,7 @@ fn start_pilot_thread(periph: &mut GpioPeripherals) -> Result<Receiver<(f32, f32
 }
 
 fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, HwError> {
+    // TODO: This is wrong. fix to not lose the channel.
     let (fault_tx, fault_rx) = bounded(16);
     let pins = periph.get_pins();
 
@@ -380,7 +385,7 @@ impl EVSEHardware for EVSEHardwareImpl {
     }
 }
 
-fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T) -> Result<(), HwError> 
+fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T, listen_to_pilot: &Arc<AtomicBool>) -> Result<(), HwError> 
 where T: EVSEHardware
 {
     debug!("Do state transition: {:?}", state);
@@ -388,9 +393,9 @@ where T: EVSEHardware
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
             hw.set_waiting_for_vehicle()?;
-            hw.set_ground_test_pin(OnOff::Off)?;
-
+            
             thread::sleep(Duration::from_millis(200));
+            listen_to_pilot.store(true, Ordering::Relaxed);
         },
         EVSEMachineState::VehicleDetected => {
             hw.set_contactor(OnOff::Off)?;
@@ -430,8 +435,10 @@ pub fn start_machine<T>(mut evse: T) -> !
 where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
+    let liste_to_pilot = Arc::new(AtomicBool::new(false));
+    
 
-    let pilot_voltage_chan = start_pilot_thread(evse.get_peripherals()).unwrap();
+    let pilot_voltage_chan = start_pilot_thread(evse.get_peripherals(), Arc::clone(&liste_to_pilot)).unwrap();
     let fault_chan = start_fault_thread(evse.get_peripherals()).unwrap();
 
     loop {
@@ -440,6 +447,7 @@ where T: EVSEHardware + Send + Sync
             EVSEMachineState::SelfTest => {
                 // Do the self test
                 let self_test_result = run_gfi_self_test(&mut evse);
+                liste_to_pilot.store(false, Ordering::Relaxed);
                 match self_test_result {
                     Err(e) => {
                         state_input = EVSEMachineInput::SelfTestFailed;
@@ -479,7 +487,7 @@ where T: EVSEHardware + Send + Sync
                 // We will decide on a pilot error, or we'll get one from the channel if 
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
-                let res = do_state_transition(state, &mut evse);
+                let res = do_state_transition(state, &mut evse, &liste_to_pilot);
                 match res {
                     Err(e) => {
                         error!("Error: {:?}", e);
