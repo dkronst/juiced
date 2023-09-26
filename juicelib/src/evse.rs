@@ -373,12 +373,12 @@ impl EVSEHardware for EVSEHardwareImpl {
     fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
         self.contactor = state.clone();
         self.hw_peripherals.set_contactor_pin(state.clone().into());
-        self.hw_peripherals.set_power_watchdog(
+        self.hw_peripherals.set_oscillate_watchdog(
             match state {
-                OnOff::On => Level::High,
-                OnOff::Off => Level::Low,
+                OnOff::On => true,
+                OnOff::Off => false
             }
-        );
+        ).change_context(HwError::HardwareFault)?;
         Ok(())
     }
 

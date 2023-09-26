@@ -49,12 +49,14 @@ pub struct Pins {
     pub relay_test_pin: InputPin,
     pub gfi_test_pin: OutputPin,
     pub gfi_reset_pin: OutputPin,
+    pub power_watchdog_pin: OutputPin,
+
+    power_watchdog_oscillating: bool,
 }
 
 pub struct GpioPeripherals {
     pilot: Pilot,
     adc: Arc<Mutex<Adc>>,
-    power_watchdog: Arc<AtomicBool>,
     pins: Arc<Mutex<Pins>>,
 }
 
@@ -78,9 +80,6 @@ impl GpioPeripherals {
         gfi_reset_pin.set_low();
 
 
-        let power_watchdog = Arc::new(AtomicBool::new(false));
-
-        Self::power_pin_thread(power_watchdog_pin, Arc::clone(&power_watchdog));
         let adc = Arc::new(Mutex::new(Adc::new().unwrap()));
 
         let pins = Arc::new(Mutex::new(Pins {
@@ -90,11 +89,12 @@ impl GpioPeripherals {
             relay_test_pin: relay_test_pin,
             gfi_test_pin: gfi_test_pin,
             gfi_reset_pin: gfi_reset_pin,
+            power_watchdog_pin: power_watchdog_pin,
+            power_watchdog_oscillating: false,
         }));
 
         Self {
             adc: adc,
-            power_watchdog: power_watchdog,
             pilot: pilot,
             pins: pins,
         }
@@ -104,59 +104,28 @@ impl GpioPeripherals {
         Arc::clone(&self.adc)
     }
 
-    pub fn set_power_watchdog(&mut self, level: Level) {
-        let state = match level {
-            Level::Low => false,
-            Level::High => true,
-        };
-        self.power_watchdog.store(state, std::sync::atomic::Ordering::Relaxed);
+    pub fn set_oscillate_watchdog(&mut self, oscillate: bool) -> Result<(), PeripheralsError> {
+        let freq = 10000.;  // Better to use > 10KHz since the watchdog is sensitive to small jitter
+        let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
+        if pins.power_watchdog_oscillating == oscillate {
+            return Ok(());
+        }
+        if oscillate {
+            pins.power_watchdog_pin.set_pwm_frequency(freq, 0.5).change_context(PeripheralsError)?;
+        } else if pins.power_watchdog_oscillating {
+            pins.power_watchdog_pin.set_pwm_frequency(freq, 0.).change_context(PeripheralsError)?;
+        }
+        pins.power_watchdog_oscillating = oscillate;
+        Ok(())
     }
 
     pub fn set_pilot_ampere(&mut self, ampere: f32) -> Result<(), PeripheralsError> {
-        debug!("Setting pilot offer to {}A", ampere);
         let duty_cycle = ampere / 0.6 / 100.; // Based on: https://www.fveaa.org/fb/J1772_386.pdf
         self.pilot.set_duty_cycle(duty_cycle as f64).change_context(PeripheralsError)
     }
 
     pub fn set_waiting_for_vehicle(&mut self) -> Result<(), PeripheralsError> {
         self.pilot.set_to_waiting_for_vehicle().change_context(PeripheralsError)
-    }
-
-    fn power_pin_thread(mut wdp: OutputPin, watch_dog: Arc<AtomicBool>) {
-        let mut state = Level::High;
-        
-        wdp.set_low();
-        thread::spawn(move || {
-            let mut i = 0;
-            let mut state_changes = 0;
-            let mut last = std::time::Instant::now();
-            loop {
-                let togle = watch_dog.load(std::sync::atomic::Ordering::Relaxed);
-                thread::sleep(Duration::from_micros(900));
-                if togle {
-                    state = match state {
-                        Level::Low => Level::High,
-                        Level::High => Level::Low,
-                    };
-                    wdp.write(state);
-                    state_changes += 1;
-                } else if state == Level::High {
-                    wdp.write(Level::Low);
-                }
-
-                if i % 1000 == 0 {
-                    let now = std::time::Instant::now();
-                    if now - last > std::time::Duration::from_millis(2000) && togle {
-                        debug!("power watchdog: toggles per second: {} (Hz)", state_changes as f32 / (now - last).as_secs_f32());
-                        state_changes = 0;
-                        last = now;
-                    }
-                    // TODO: Make sure the watchdog oscilates at around 1 kHz, otherwise raise an error
-                    i = 0;
-                }
-            }
-        });
-        thread::sleep(std::time::Duration::from_millis(500));
     }
 
     pub fn set_contactor_pin(&mut self, level: Level) {
@@ -219,9 +188,9 @@ mod testgpio {
     #[test]
     fn test_set_power_watchdog() {
         let mut gpio = GPIO.lock().unwrap();
-        gpio.set_power_watchdog(Level::High);
+        gpio.set_oscillate_watchdog(true);
         thread::sleep(Duration::from_millis(100));
-        gpio.set_power_watchdog(Level::Low);
+        gpio.set_oscillate_watchdog(false);
     }
 
     #[test]
