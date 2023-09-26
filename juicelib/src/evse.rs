@@ -4,18 +4,19 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar}};
+use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, RwLock}};
 
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
 
 use error_stack::{Context, Report, Result, ResultExt};
 
-use log::{info, warn, error, debug};
+use log::{info, error, debug};
 
 use crossbeam_channel::{Receiver, Select, bounded};
 
-use crate::peripherals::{GpioPeripherals, PeripheralsError};
+use crate::peripherals::GpioPeripherals;
+use crate::sensors::SensorsState;
 
 const MAINS_FREQUENCY_HZ: f64 = 50.; // Hz
 const GFI_TEST_CYCLES: u64 = 10; // 10 cycles
@@ -171,7 +172,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
     match oper.index() {
         0 => {
             let voltage = oper.recv(&pilot_voltage_chan);
-            if let Err(x) = voltage {
+            if let Err(_) = voltage {
                 return EVSEMachineInput::PilotInError;
             }
             debug!("Pilot voltage: {:?}", voltage);
@@ -224,14 +225,17 @@ impl std::fmt::Display for HwError {
     }
 }
 
-fn start_pilot_thread(periph: &mut GpioPeripherals, listen_to_pilot: Arc<AtomicBool>) -> Result<Receiver<(f32, f32)>, HwError> {
+fn start_adc_thread(periph: &mut GpioPeripherals, listen_to_pilot: Arc<AtomicBool>, sensors_state: Arc<RwLock<SensorsState>>) -> Result<Receiver<(f32, f32)>, HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
     thread::spawn(move || {
         loop {
-            let (min, max);
+            let (min, max, current, voltage);
             {
-                (min, max) = adc.lock().unwrap().peak_to_peak_pilot().unwrap();
+                let locked_adc = adc.lock().unwrap();
+                (min, max) = locked_adc.peak_to_peak_pilot().unwrap();
+                current = locked_adc.read_current_sense_rms().unwrap();
+                voltage = locked_adc.peak_mains_voltage().unwrap();
             }
             thread::sleep(Duration::from_millis(200));
             if listen_to_pilot.load(Ordering::Relaxed) {
@@ -242,6 +246,11 @@ fn start_pilot_thread(periph: &mut GpioPeripherals, listen_to_pilot: Arc<AtomicB
                     },
                     _ => {}
                 }
+            }
+            {
+                let mut locked_sensors_state = sensors_state.write().unwrap();
+                locked_sensors_state.current_sensor = current;
+                locked_sensors_state.mains_peak = voltage;
             }
         }
     });
@@ -457,9 +466,13 @@ where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
     let liste_to_pilot = Arc::new(AtomicBool::new(false));
-    
+    let sensor_state = Arc::new(RwLock::new(SensorsState::new()));
 
-    let pilot_voltage_chan = start_pilot_thread(evse.get_peripherals(), Arc::clone(&liste_to_pilot)).unwrap();
+    let pilot_voltage_chan = start_adc_thread(
+        evse.get_peripherals(),
+        Arc::clone(&liste_to_pilot),
+        Arc::clone(&sensor_state)
+    ).unwrap();
     let fault_chan = start_fault_thread(evse.get_peripherals()).unwrap();
 
     loop {

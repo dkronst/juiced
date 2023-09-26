@@ -1,4 +1,4 @@
-use std::{sync::{atomic::AtomicBool, Arc, Mutex}, thread, time::Duration, fmt::{Display, Formatter, self}};
+use std::{sync::{Arc, Mutex}, thread, fmt::{Display, Formatter, self}};
 
 use error_stack::{Context, ResultExt, Result, Report};
 ///
@@ -9,7 +9,7 @@ use error_stack::{Context, ResultExt, Result, Report};
 use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
 use crate::{pilot::Pilot, adc::Adc};
 
-use log::{info, warn, error, debug, trace};
+use log::debug;
 
 #[derive(Debug)]
 pub struct PeripheralsError;
@@ -43,7 +43,6 @@ const GFI_TEST_PIN: u8 = 24;
 const GFI_RESET_PIN: u8 = 27;
 
 pub struct Pins {
-    gpio: Gpio,
     pub contactor_pin: OutputPin,
     pub gfi_status_pin: InputPin,
     pub relay_test_pin: InputPin,
@@ -83,7 +82,6 @@ impl GpioPeripherals {
         let adc = Arc::new(Mutex::new(Adc::new().unwrap()));
 
         let pins = Arc::new(Mutex::new(Pins {
-            gpio: gpio,
             contactor_pin: contactor_pin,
             gfi_status_pin: gfi_status_pin,
             relay_test_pin: relay_test_pin,
@@ -188,9 +186,9 @@ mod testgpio {
     #[test]
     fn test_set_power_watchdog() {
         let mut gpio = GPIO.lock().unwrap();
-        gpio.set_oscillate_watchdog(true);
+        gpio.set_oscillate_watchdog(true).unwrap();
         thread::sleep(Duration::from_millis(100));
-        gpio.set_oscillate_watchdog(false);
+        gpio.set_oscillate_watchdog(false).unwrap();
     }
 
     #[test]
@@ -220,7 +218,7 @@ mod testgpio {
     #[test]
     fn test_set_gfi_reset_pin() {
         let mut gpio = GPIO.lock().unwrap();
-        gpio.gfi_reset();
+        gpio.gfi_reset().unwrap();
     }
 
     #[test]

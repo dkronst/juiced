@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi, Error as LibError};
-use log::{debug, info};
+use log::{debug, warn};
 
 // This file defines a private (to this crate) struct called Adc. It has a
 // public method called new() which returns a Result<Adc, AdcError>. The
@@ -111,7 +111,33 @@ impl Adc {
         Ok((Self::from_vdiv_to_pilot(min), Self::from_vdiv_to_pilot(max)))
     }
 
-    pub fn read_current_sense(&mut self) -> Result<f32, AdcError> {
+
+    pub fn read_current_sense_rms(&self) -> Result<f32, AdcError> {
+        let mut sum = 0.0;
+        let mut count = 0;
+        let start = std::time::Instant::now();
+        let mut zero_crossings = 0;
+        
+        let mut prev_reading = self.read_current_sense_one_sample()?;
+        while zero_crossings < 2 && count < 5000 {
+            let reading = self.read_current_sense_one_sample()?;
+            let diff = reading - prev_reading;
+            if (diff > 0.0 && reading > 0.0) || (diff < 0.0 && reading < 0.0) {
+                zero_crossings += 1;
+            }
+            prev_reading = reading;
+            sum += reading * reading;
+            count += 1;
+        }
+        let rms = (sum / count as f32).sqrt();
+        if count < 10 {
+            warn!("Warning: Current sense RMS is based on {} samples, taking {}ms", count, start.elapsed().as_millis());
+        }
+        Ok(rms)
+    }
+
+    #[inline]
+    fn read_current_sense_one_sample(&self) -> Result<f32, AdcError> {
         let reading = self.mcp.single_ended_read(Self::CURRENT_SENSE_CHANNEL)?;
         let curr = Self::to_amps(reading);
         Ok(curr)
@@ -137,24 +163,20 @@ impl Adc {
         Ok((min_volts, max_volts))
     }
 
-    pub fn rms_voltage(&mut self, channel: u8, duration: Duration) -> Result<f32, AdcError> {
-        let mut sum = 0.0;
-        let mut count = 0;
-        let start = std::time::Instant::now();
+    /// Returns the peak voltage of the AC voltage.
+    pub fn peak_mains_voltage(&self) -> Result<f32, AdcError> {
+        let (min, max) = self.peak_to_peak(Self::AC_VOLTAGE_CHANNEL, Duration::from_millis(1000/50))?;
 
-        while start.elapsed() < duration {
-            let reading = self.mcp.single_ended_read(channel)?;
-            let volts = Self::to_volts(reading);
-            sum += volts * volts;
-            count += 1;
-        }
-        let rms = (sum / count as f32).sqrt();
-        Ok(rms)
+        let mains_peak = vec![min.abs(), max.abs()].iter().max_by(|x, y| x.partial_cmp(y).unwrap()).unwrap().abs();
+        
+        Ok(mains_peak)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use log::info;
+
     use super::*;
 
     #[test]
@@ -181,15 +203,15 @@ mod tests {
 
     #[test]
     fn test_read_current_sense() -> Result<(), AdcError> {
-        let mut adc = Adc::new()?;
-        let current = adc.read_current_sense()?;
+        let adc = Adc::new()?;
+        let current = adc.read_current_sense_rms()?;
         assert!(current >= -50.0 && current <= 50.0);
         Ok(())
     }
 
     #[test]
     fn test_ac_voltage() {
-        let mut adc = Adc::new().unwrap();
+        let adc = Adc::new().unwrap();
         let reading = adc.mcp.single_ended_read(Adc::AC_VOLTAGE_CHANNEL).unwrap();
         let voltage = Adc::to_volts(reading);
 
@@ -197,11 +219,6 @@ mod tests {
         assert!(p2pv.is_ok());
         let (min, max) = p2pv.unwrap();
 
-        let rms = adc.rms_voltage(Adc::AC_VOLTAGE_CHANNEL, Duration::from_millis(1000/50));
-        assert!(rms.is_ok());
-        let rms = rms.unwrap();
-
-        info!("RMS: {}", rms);
         info!("Min: {}, Max: {}", min, max);
         info!("AC Voltage: {}", voltage);
     }

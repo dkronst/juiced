@@ -1,8 +1,7 @@
 use std::{time::Duration, fmt::{Display, Formatter, self}};
 use error_stack::{ResultExt, Context, Result};
-use rppal::{pwm::{Pwm, Channel, Polarity}, gpio::{Gpio, Level}};
+use rppal::pwm::{Pwm, Channel, Polarity};
 
-use log::{info, warn, error, debug, trace};
 
 pub struct Pilot {
     pwm: Pwm,

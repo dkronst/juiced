@@ -131,8 +131,8 @@ The following section describes the crucial steps of the service loop that shoul
 
 6. **GFI Line**: If the GFI line is high, it's a ground fault. Turn the power off and report an error on the pilot (stop oscillating - leave it either 0% or 100% duty). Before attempting to turn the power back on, reset the GFI once the clearance interval has elapsed.
 
-7. **Current and Voltage Measurement**: Use ADCs on channel 1 to observe the current drawn by the vehicle. Collect samples for two zero crossings (zero is 512), perform an RMS on the samples, and scale it to obtain an RMS current draw. Use ADCs on channel 2 to figure out the AC voltage; look for the peak and scale that to determine the voltage.
-
+7. **Current and Voltage Measurement**: Use ADCs on channel 1 to observe the current drawn by the vehicle. Collect samples for two zero crossings (zero is 512), perform an RMS on the samples, and scale it to obtain an RMS current draw. se ADCs on channel 2 to figure out the AC voltage; look for the peak and scale that to determine the voltage.
+U
 8. **Pilot Change Grace Period**: Allow the car a 5-second grace period to respond to any changes to the pilot, including withdrawing the pilot while the vehicle is charging.
 
 9. **Power State Changes**: Unless responding to a GFI, do not turn off the power other than in response to a `[C, D] -> B` state change. Doing so is bad for the contactor as the vehicle will arrange for current draw to be reduced to near zero before changing state. Similarly, do not turn the power on other than in response to a `B -> [C, D]` transition.
