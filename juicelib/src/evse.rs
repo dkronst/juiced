@@ -9,7 +9,7 @@ use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Co
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
 
-use error_stack::{Context, Report, Result, ResultExt};
+use error_stack::{Context, Report, Result, ResultExt, ensure};
 
 use log::{info, error, debug};
 
@@ -249,8 +249,8 @@ fn start_adc_thread(periph: &mut GpioPeripherals, listen_to_pilot: Arc<AtomicBoo
             }
             {
                 let mut locked_sensors_state = sensors_state.write().unwrap();
-                locked_sensors_state.current_sensor = current;
-                locked_sensors_state.mains_peak = voltage;
+                locked_sensors_state.add_cs_reading(current as f64);
+                locked_sensors_state.add_mains_peak_reading(voltage as f64);
             }
         }
     });
@@ -309,6 +309,10 @@ pub trait EVSEHardware {
 
     fn get_gfi_status_pin(&mut self) -> Level {
         self.get_peripherals().read_gfi_status_pin()
+    }
+
+    fn get_relay_test_pin(&mut self) -> Level {
+        self.get_peripherals().read_relay_test_pin()
     }
 
     fn gfi_reset(&mut self) -> Result<(), HwError> {
@@ -420,12 +424,15 @@ where T: EVSEHardware
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
             hw.set_waiting_for_vehicle()?;
-            
-            thread::sleep(Duration::from_millis(200));
+                        
+            thread::sleep(Duration::from_millis(1000));
             listen_to_pilot.store(true, Ordering::Relaxed);
+            ensure!(hw.get_relay_test_pin() == Level::Low, HwError::HardwareFault);
         },
         EVSEMachineState::VehicleDetected => {
             hw.set_contactor(OnOff::Off)?;
+            thread::sleep(Duration::from_millis(100));
+            ensure!(hw.get_relay_test_pin() == Level::Low, HwError::HardwareFault);
             hw.set_current_offer_ampere(T::MAX_CURRENT_OFFER)?;
             hw.set_ground_test_pin(OnOff::On)?;
         },
@@ -446,14 +453,19 @@ where T: EVSEHardware
                     }
                 }
             }
+            // At this point, the contactor is On and the mains should be connected.
+            // Make sure that the 220V is high
+            ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
         },
         EVSEMachineState::NoPower => {
             hw.set_current_offer_ampere(0.)?;
             hw.set_contactor(OnOff::Off)?;
             hw.set_ground_test_pin(OnOff::Off)?;
+            ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
         }
         _ => {
             hw.set_contactor(OnOff::Off)?;
+            ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
             // Do nothing otherwise
         }
     }
@@ -536,10 +548,11 @@ where T: EVSEHardware + Send + Sync
                         state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
                     }
                 }
-                debug!("Current sensor state: {:?}", sensor_state.read().unwrap());
+                debug!("Current sensor state: {}", sensor_state.read().unwrap());
             }
         }
-        debug!("State input: {:?}", state_input);                
+        debug!("State input: {:?}", state_input);
+        // TODO: Don't perform state change if there is no transition
         let output = machine.consume(&state_input);
         debug!("Output: {:?}", output);
         debug!("State: {:?}", machine.state());

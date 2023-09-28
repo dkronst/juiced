@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi, Error as LibError};
-use log::{debug, warn};
+use log::debug;
 
 // This file defines a private (to this crate) struct called Adc. It has a
 // public method called new() which returns a Result<Adc, AdcError>. The
@@ -45,12 +45,11 @@ pub trait Mcp3004 {
 impl Mcp3004 for Spi {
     fn single_ended_read(&self, channel: u8) -> Result<u16, LibError> {
         let mut read_buffer = [0u8; 3];
-        let write_buffer = [0b0000_0001, 0b1000_0000 | channel << 4, 0b0000_0000];
+        let write_buffer = [0b0000_0001, 0b1100_0000 | channel << 4, 0b0000_0000];
 
         self.transfer(&mut read_buffer, &write_buffer)?;
 
         let value = ((read_buffer[1] as u16 & 0x03) << 8) | read_buffer[2] as u16;
-        // debug!("Read: {:?}, Write: {:?}, value: {}", read_buffer, write_buffer, value);
 
         Ok(value)
     }
@@ -61,7 +60,8 @@ impl Adc {
     const PILOT_VOLTAGE_CHANNEL: u8 = 0;
     const CURRENT_SENSE_CHANNEL: u8 = 1;
     const AC_VOLTAGE_CHANNEL:    u8 = 2;
-    const SPI_FREQUENCY:        u32 = 200_000;  // Tested empirically, 300kHz is the fastest that works linearly.
+    const CS_SCALE_FACTOR:      f32 = (16./(6.75))/0.066;    // => 16A -> x = 6.75 y(6.75) = 16A   y(0) = 0, x = t/0.066 => y(t) = t/0.066 * 6.75
+    const SPI_FREQUENCY:        u32 = 300_000;  // Tested empirically, 300kHz is the fastest that works linearly.
     const SPI_MODE:            Mode = Mode::Mode0;
     const SPI_BUS:              Bus = Bus::Spi0;
     const SPI_SLAVE_SELECT: SlaveSelect = SlaveSelect::Ss0;
@@ -82,7 +82,7 @@ impl Adc {
 
     fn to_amps(reading: u16) -> f32 {
         let voltage = (reading as f32) * Self::REFERENCE_VOLTAGE / 1024.0;
-        let amps = (voltage - Self::REFERENCE_VOLTAGE/2.) / 0.066;
+        let amps = (voltage - Self::REFERENCE_VOLTAGE/2.) * Self::CS_SCALE_FACTOR;
         amps
     }
 
@@ -116,23 +116,14 @@ impl Adc {
         let mut sum = 0.0;
         let mut count = 0;
         let start = std::time::Instant::now();
-        let mut zero_crossings = 0;
         
-        let mut prev_reading = self.read_current_sense_one_sample()?;
-        while zero_crossings < 4 && count < 5000 {
+        for _ in 0..75 {
             let reading = self.read_current_sense_one_sample()?;
-            let diff = reading - prev_reading;
-            if (diff > 0.0 && reading > 0.0) || (diff < 0.0 && reading < 0.0) {
-                zero_crossings += 1;
-            }
-            prev_reading = reading;
             sum += reading * reading;
             count += 1;
         }
+        debug!("Current sense: {} samples in {} ms", count, start.elapsed().as_millis());
         let rms = (sum / count as f32).sqrt();
-        if count < 10 {
-            warn!("Warning: Current sense RMS is based on {} samples, taking {}ms", count, start.elapsed().as_millis());
-        }
         Ok(rms)
     }
 
