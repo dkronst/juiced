@@ -53,6 +53,37 @@ pub struct Pins {
     power_watchdog_oscillating: bool,
 }
 
+trait PigPioPwm {
+    fn set_pio_pwm_dc(&mut self, duty_cycle: f64) -> Result<(), PeripheralsError>;
+}
+
+fn execute_pigs_command(command: &str) -> Result<(), PeripheralsError> {
+    debug!("Executing command: {}", command);
+    let output = std::process::Command::new("pigs")
+        .arg(command)
+        .output()
+        .change_context(PeripheralsError)?;
+    if !output.status.success() {
+        return Err(Report::new(PeripheralsError));
+    }
+    Ok(())
+}
+
+
+impl PigPioPwm for OutputPin {
+    fn set_pio_pwm_dc(&mut self, duty_cycle: f64) -> Result<(), PeripheralsError> {
+        let frequency = 10000;
+        let duty_cycle = duty_cycle;
+        // Start with range = 255 (default)
+        let range = (duty_cycle*255.) as u32;
+        let pin = self.pin();
+        for cmd in [format!("pfs {} {}", pin, frequency), format!("p {} {}", pin, range)] {
+            execute_pigs_command(&cmd)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct GpioPeripherals {
     pilot: Pilot,
     adc: Arc<Mutex<Adc>>,
@@ -103,15 +134,14 @@ impl GpioPeripherals {
     }
 
     pub fn set_oscillate_watchdog(&mut self, oscillate: bool) -> Result<(), PeripheralsError> {
-        let freq = 10000.;  // Better to use > 10KHz since the watchdog is sensitive to small jitter
         let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
         if pins.power_watchdog_oscillating == oscillate {
             return Ok(());
         }
         if oscillate {
-            pins.power_watchdog_pin.set_pwm_frequency(freq, 0.5).change_context(PeripheralsError)?;
+            pins.power_watchdog_pin.set_pio_pwm_dc(0.5).change_context(PeripheralsError)?;
         } else if pins.power_watchdog_oscillating {
-            pins.power_watchdog_pin.set_pwm_frequency(freq, 0.).change_context(PeripheralsError)?;
+            pins.power_watchdog_pin.set_pio_pwm_dc(0.).change_context(PeripheralsError)?;
         }
         pins.power_watchdog_oscillating = oscillate;
         Ok(())

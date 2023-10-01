@@ -371,27 +371,21 @@ impl EVSEHardwareImpl {
         };
         ret.set_contactor(OnOff::Off).unwrap();
         ret.set_current_offer_ampere(0.0).unwrap();
-        ret.set_gfi_test_pin(OnOff::Off).unwrap();
+        ret.set_ground_test_pin(OnOff::Off).unwrap();
         ret
-    }
-
-    fn set_gfi_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
-        self.ground_test_pin = state.clone();
-        self.hw_peripherals.set_gfi_test_pin(state.into());
-        Ok(())
     }
 }
 
 impl EVSEHardware for EVSEHardwareImpl {
     fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
         self.contactor = state.clone();
-        self.hw_peripherals.set_contactor_pin(state.clone().into());
         self.hw_peripherals.set_oscillate_watchdog(
             match state {
                 OnOff::On => true,
                 OnOff::Off => false
             }
         ).change_context(HwError::HardwareFault)?;
+        self.hw_peripherals.set_contactor_pin(state.clone().into());
         Ok(())
     }
 
@@ -424,7 +418,7 @@ where T: EVSEHardware
         EVSEMachineState::Standby => {
             hw.set_contactor(OnOff::Off)?;
             hw.set_waiting_for_vehicle()?;
-                        
+
             thread::sleep(Duration::from_millis(1000));
             listen_to_pilot.store(true, Ordering::Relaxed);
             ensure!(hw.get_relay_test_pin() == Level::Low, HwError::HardwareFault);
@@ -434,7 +428,7 @@ where T: EVSEHardware
             thread::sleep(Duration::from_millis(100));
             ensure!(hw.get_relay_test_pin() == Level::Low, HwError::HardwareFault);
             hw.set_current_offer_ampere(T::MAX_CURRENT_OFFER)?;
-            hw.set_ground_test_pin(OnOff::On)?;
+            hw.set_ground_test_pin(OnOff::Off)?;
         },
         EVSEMachineState::Charging => {
             let state = hw.get_contactor_state()?;

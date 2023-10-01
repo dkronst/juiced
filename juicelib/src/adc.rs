@@ -66,6 +66,7 @@ impl Adc {
     const SPI_BUS:              Bus = Bus::Spi0;
     const SPI_SLAVE_SELECT: SlaveSelect = SlaveSelect::Ss0;
     const REFERENCE_VOLTAGE:    f32 = 5.0;
+    const NUM_SAMPLES:          u32 = 20;
 
     pub fn new() -> Result<Self, AdcError> {
         let spi = Spi::new(Self::SPI_BUS, Self::SPI_SLAVE_SELECT, Self::SPI_FREQUENCY, Self::SPI_MODE)?;
@@ -117,7 +118,7 @@ impl Adc {
         let mut count = 0;
         let start = std::time::Instant::now();
         
-        for _ in 0..75 {
+        for _ in 0..Self::NUM_SAMPLES {
             let reading = self.read_current_sense_one_sample()?;
             sum += reading * reading;
             count += 1;
