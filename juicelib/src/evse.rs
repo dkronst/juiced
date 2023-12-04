@@ -9,7 +9,7 @@ use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Co
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
 
-use error_stack::{Context, Report, Result, ResultExt, ensure};
+use error_stack::{Context, Report, Result, ResultExt, ensure, report};
 
 use log::{info, error, debug};
 
@@ -59,7 +59,7 @@ state_machine! {
     VehicleDetected => {
         PilotIs12V => Standby [VehicleDisconnected],
         PilotIs9V => VehicleDetected [NoTransition],
-        PilotIs6V => Charging [OfferCharging],
+        PilotIs6V => StartCharging [OfferCharging],
         PilotIs3V => VentilationNeeded,
         PilotIsNegative12V => NoPower,
         PilotInError => ResetableError [PilotMeasurement],
@@ -67,7 +67,26 @@ state_machine! {
         NoGround => FailedStation [NoGroundError],
         HardwareFault => FailedStation [HardwareFault],
     },
+    StartCharging => {
+        PilotInError => ResetableError [PilotMeasurement],
+        GFIInterrupted => FailedStation [GFIError],
+        NoGround => FailedStation [NoGroundError],
+        HardwareFault => FailedStation [HardwareFault],
+        SelfTestOk => Charging [NoTransition],
+        SelfTestFailed => ResetableError [SelfTestError],
+    },
     Charging => {
+        PilotIs12V => StopCharging [VehicleDisconnected],
+        PilotIs9V => StopCharging [ChargingFinished],
+        PilotIs6V => Charging [NoTransition],
+        PilotIs3V => VentilationNeeded [UnsupportedVehicle],
+        PilotIsNegative12V => StopCharging [NoPower],
+        PilotInError => StopCharging [PilotMeasurement],
+        GFIInterrupted => FailedStation [GFIError],
+        NoGround => FailedStation [NoGroundError],
+        HardwareFault => FailedStation [HardwareFault],
+    },
+    StopCharging => {
         PilotIs12V => ResetableError [VehicleDisconnected],
         PilotIs9V => VehicleDetected [ChargingFinished],
         PilotIs6V => Charging [NoTransition],
@@ -430,6 +449,12 @@ where T: EVSEHardware
             hw.set_current_offer_ampere(T::MAX_CURRENT_OFFER)?;
             hw.set_ground_test_pin(OnOff::Off)?;
         },
+        EVSEMachineState::StartCharging => {
+            thread::sleep(Duration::from_secs(1)); // Protocol requires 1 second of waiting for the vehicle to be ready
+            ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Incorrect relay test pin state"));
+            hw.set_contactor(OnOff::Off)?;
+            thread::sleep(Duration::from_millis(200));
+        },
         EVSEMachineState::Charging => {
             let state = hw.get_contactor_state()?;
             debug!("Machine is set to 'Charging'. Contactor state: {:?}", state);
@@ -450,6 +475,13 @@ where T: EVSEHardware
             // At this point, the contactor is On and the mains should be connected.
             // Make sure that the 220V is high
             ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
+        },
+        EVSEMachineState::StopCharging => {
+            hw.set_current_offer_ampere(0.)?;
+            thread::sleep(Duration::from_secs(2)); // Disconnecting requires that the vehicle stops the charge cycle of else the contactor will be damaged
+            hw.set_contactor(OnOff::Off)?;
+            hw.set_ground_test_pin(OnOff::Off)?;
+            ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Relay should be off when charging is stopped"));
         },
         EVSEMachineState::NoPower => {
             hw.set_current_offer_ampere(0.)?;
