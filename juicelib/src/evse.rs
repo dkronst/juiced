@@ -87,7 +87,7 @@ state_machine! {
         HardwareFault => FailedStation [HardwareFault],
     },
     StopCharging => {
-        ChargingFinished => Standby [NoTransition],
+        ChargingFinished => NoPower [ForcedTransition],  // This is required to reset the charging cycle on the vehicle side
         PilotInError => ResetableError [PilotMeasurement],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
@@ -95,6 +95,7 @@ state_machine! {
     },
     NoPower => {
         PilotIsNegative12V => NoPower [ChargingFinished],
+        WaitComplete => Standby [ForcedTransition],
         HardwareFault => FailedStation [HardwareFault],
     },
     ResetableError => {
@@ -378,6 +379,7 @@ impl From<Level> for OnOff {
 
 impl EVSEHardwareImpl {
     pub fn new() -> Self {
+        // TODO: Remove the unwrap
         let mut ret = Self {
             contactor: OnOff::Off,
             current_offer: 0.0,
@@ -487,6 +489,9 @@ where T: EVSEHardware
             ensure!(hw.get_relay_test_pin() == Level::High, report!(HwError::HardwareFault).attach_printable("Relay should be on when charging"));
         },
         EVSEMachineState::StopCharging => {
+            // At this point the vehicle has signaled that it's done charging or that it wants to stop charging.
+            // We need to turn off the contactor and wait for the vehicle to stop the current.
+            listen_to_pilot.store(false, Ordering::Relaxed);
             hw.set_current_offer_ampere(0.)?;
             thread::sleep(Duration::from_secs(2)); // Disconnecting requires that the vehicle stops the charge cycle of else the contactor will be damaged
             hw.set_contactor(OnOff::Off)?;
@@ -495,10 +500,15 @@ where T: EVSEHardware
             next_state_input = Some(EVSEMachineInput::ChargingFinished);
         },
         EVSEMachineState::NoPower => {
-            hw.set_current_offer_ampere(0.)?;
+            // This is a transient state in which we tell the vehicle that we want to reset the charging
+            // cycle.
             hw.set_contactor(OnOff::Off)?;
             hw.set_ground_test_pin(OnOff::Off)?;
-            ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
+            thread::sleep(Duration::from_millis(100)); // Waiting for the contactor to turn off completely
+            ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Relay should now be off"));
+            info!("Waiting 5s for the vehicle to stop charging. (NoPower state)");
+            thread::sleep(Duration::from_secs(5));
+            next_state_input = Some(EVSEMachineInput::WaitComplete);   // After this, we'll go to Standby starting the cycle again.
         }
         _ => {
             hw.set_contactor(OnOff::Off)?;
@@ -506,7 +516,7 @@ where T: EVSEHardware
             // Do nothing otherwise
         }
     }
-    debug!("State transition done");
+    debug!("State transition done. Next state input: {:?}, current state: {:?}", next_state_input, state);
     Ok(next_state_input)
 }
 

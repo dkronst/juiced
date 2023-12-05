@@ -162,7 +162,7 @@ impl GpioPeripherals {
     pub fn set_contactor_pin(&mut self, level: Level) {
         let mut pins = self.pins.lock().unwrap();
         pins.contactor_pin.write(level);
-    }
+            }
 
     pub fn reset_gfi_status_pin(&mut self) -> Result<(), PeripheralsError> {
         let mut pins = self.pins.lock().unwrap();
