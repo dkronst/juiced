@@ -87,11 +87,7 @@ state_machine! {
         HardwareFault => FailedStation [HardwareFault],
     },
     StopCharging => {
-        PilotIs12V => ResetableError [VehicleDisconnected],
-        PilotIs9V => VehicleDetected [ChargingFinished],
-        PilotIs6V => Charging [NoTransition],
-        PilotIs3V => VentilationNeeded [UnsupportedVehicle],
-        PilotIsNegative12V => NoPower [ChargingFinished],
+        ChargingFinished => Standby [NoTransition],
         PilotInError => ResetableError [PilotMeasurement],
         GFIInterrupted => FailedStation [GFIError],
         NoGround => FailedStation [NoGroundError],
@@ -398,13 +394,22 @@ impl EVSEHardwareImpl {
 impl EVSEHardware for EVSEHardwareImpl {
     fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
         self.contactor = state.clone();
-        self.hw_peripherals.set_oscillate_watchdog(
-            match state {
-                OnOff::On => true,
-                OnOff::Off => false
-            }
-        ).change_context(HwError::HardwareFault)?;
+        let oscillate = match state {
+            OnOff::On => true,
+            OnOff::Off => false
+        };
+
+        if oscillate {
+            info!("Setting power watchdog to oscillate");
+            self.hw_peripherals.set_oscillate_watchdog(oscillate).change_context(HwError::HardwareFault)
+                    .attach_printable("Failed to set power watchdog to oscillate")?;
+        }
         self.hw_peripherals.set_contactor_pin(state.clone().into());
+        if !oscillate {
+            info!("Stopping power watchdog");
+            self.hw_peripherals.set_oscillate_watchdog(oscillate).change_context(HwError::HardwareFault)
+                    .attach_printable("Failed to stop power watchdog")?;
+        }
         Ok(())
     }
 
@@ -429,9 +434,10 @@ impl EVSEHardware for EVSEHardwareImpl {
     }
 }
 
-fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T, listen_to_pilot: &Arc<AtomicBool>) -> Result<(), HwError> 
+fn do_state_transition<T>(state: &EVSEMachineState, hw: &mut T, listen_to_pilot: &Arc<AtomicBool>) -> Result<Option<EVSEMachineInput>, HwError> 
 where T: EVSEHardware
 {
+    let mut next_state_input: Option<EVSEMachineInput> = Option::None;
     debug!("Do state transition: {:?}", state);
     match state {
         EVSEMachineState::Standby => {
@@ -454,8 +460,7 @@ where T: EVSEHardware
             ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Incorrect relay test pin state"));
             hw.set_contactor(OnOff::Off)?;
             thread::sleep(Duration::from_millis(200));
-        },
-        EVSEMachineState::Charging => {
+            next_state_input = Some(EVSEMachineInput::SelfTestOk);
             let state = hw.get_contactor_state()?;
             debug!("Machine is set to 'Charging'. Contactor state: {:?}", state);
             if OnOff::Off == state {
@@ -476,12 +481,18 @@ where T: EVSEHardware
             // Make sure that the 220V is high
             ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
         },
+        EVSEMachineState::Charging => {
+            // Basically, there's nothing to do, for now. Later, we'll need to update the UI etc.
+            // The only thing we need to do is to make sure that the contactor is on.
+            ensure!(hw.get_relay_test_pin() == Level::High, report!(HwError::HardwareFault).attach_printable("Relay should be on when charging"));
+        },
         EVSEMachineState::StopCharging => {
             hw.set_current_offer_ampere(0.)?;
             thread::sleep(Duration::from_secs(2)); // Disconnecting requires that the vehicle stops the charge cycle of else the contactor will be damaged
             hw.set_contactor(OnOff::Off)?;
-            hw.set_ground_test_pin(OnOff::Off)?;
+            thread::sleep(Duration::from_millis(100));
             ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Relay should be off when charging is stopped"));
+            next_state_input = Some(EVSEMachineInput::ChargingFinished);
         },
         EVSEMachineState::NoPower => {
             hw.set_current_offer_ampere(0.)?;
@@ -496,7 +507,7 @@ where T: EVSEHardware
         }
     }
     debug!("State transition done");
-    Ok(())
+    Ok(next_state_input)
 }
 
 pub fn start_machine<T>(mut evse: T) -> !
@@ -570,8 +581,15 @@ where T: EVSEHardware + Send + Sync
                         // such as GFI for example.
                         evse.set_contactor(OnOff::Off).unwrap_or(());
                     },
-                    _ => {
-                        state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
+                    Ok(ok) => {
+                        match ok {
+                            Some(input) => {
+                                state_input = input;
+                            },
+                            None => {
+                                state_input = get_new_state_input(pilot_voltage_chan.clone(), fault_chan.clone());
+                            }
+                        }
                     }
                 }
                 debug!("Current sensor state: {}", sensor_state.read().unwrap());

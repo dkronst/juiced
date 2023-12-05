@@ -136,11 +136,14 @@ impl GpioPeripherals {
     pub fn set_oscillate_watchdog(&mut self, oscillate: bool) -> Result<(), PeripheralsError> {
         let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
         if pins.power_watchdog_oscillating == oscillate {
+            debug!("Watchdog already in desired state");
             return Ok(());
         }
         if oscillate {
+            debug!("Oscillating watchdog");
             pins.power_watchdog_pin.set_pio_pwm_dc(0.5).change_context(PeripheralsError)?;
         } else if pins.power_watchdog_oscillating {
+            debug!("Stopping watchdog oscillation");
             pins.power_watchdog_pin.set_pio_pwm_dc(0.).change_context(PeripheralsError)?;
         }
         pins.power_watchdog_oscillating = oscillate;
