@@ -489,13 +489,12 @@ where T: EVSEHardware
             ensure!(hw.get_relay_test_pin() == Level::High, report!(HwError::HardwareFault).attach_printable("Relay should be on when charging"));
         },
         EVSEMachineState::StopCharging => {
-            // At this point the vehicle has signaled that it's done charging or that it wants to stop charging.
-            // We need to turn off the contactor and wait for the vehicle to stop the current.
+            // At this point the vehicle has signaled that it's done charging. No current should be flowing.
+            // We need to turn off the contactor and wait for the vehicle to either reset, or unlatch.
             listen_to_pilot.store(false, Ordering::Relaxed);
             hw.set_current_offer_ampere(0.)?;
-            thread::sleep(Duration::from_secs(2)); // Disconnecting requires that the vehicle stops the charge cycle of else the contactor will be damaged
             hw.set_contactor(OnOff::Off)?;
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_secs(5)); // If the vehicle is still connected, a period of time is needed for resetting the charging cycle (in the vehicle)
             ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Relay should be off when charging is stopped"));
             next_state_input = Some(EVSEMachineInput::ChargingFinished);
         },

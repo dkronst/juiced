@@ -42,7 +42,8 @@ impl Pilot {
     }
 
     pub fn set_duty_cycle(&mut self, duty_cycle: f64) -> Result<(), PilotError> {
-        if self.duty_cycle == duty_cycle {
+        let dc = self.pwm.duty_cycle().change_context(PilotError::PwmError)?;
+        if dc == duty_cycle {
             return Ok(());
         }
         self.pwm.set_duty_cycle(duty_cycle).change_context(PilotError::PwmError)?;
