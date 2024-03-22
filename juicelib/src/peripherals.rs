@@ -1,7 +1,9 @@
-use std::{error::Error, fmt::{self, Display, Formatter}, sync::{Arc, Mutex}, thread};
+use std::{fmt::{self, Display, Formatter}, sync::{Arc, Mutex}, thread};
 use std::result::Result as StdResult;
+use async_executor::LocalExecutor;
 
-use error_stack::{Context, ResultExt, Result, Report, FutureExt};
+use error_stack::{Context, ResultExt, Result, Report};
+use futures::executor::{self, block_on};
 ///
 /// Implementation of the peripherals module.
 ///
@@ -9,7 +11,6 @@ use error_stack::{Context, ResultExt, Result, Report, FutureExt};
 // use gpio's hal
 use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
 use apigpio::{Connection, PigpiodError, Pulse, WaveId};
-use futures::executor::block_on;
 use crate::{pilot::Pilot, adc::Adc};
 
 use log::{debug, info};
@@ -65,8 +66,10 @@ pub struct OutputPinWithPwm {
     duty_cycle: f64,
     conn: Connection,
     wave_id: Option<WaveId>,
+    executor: LocalExecutor,
 }
 
+/// Run an async function until completion
 impl TryFrom<OutputPin> for OutputPinWithPwm {
     type Error = Report<PeripheralsError>;
     fn try_from(pin: OutputPin) -> StdResult<Self, Self::Error> {
@@ -74,11 +77,16 @@ impl TryFrom<OutputPin> for OutputPinWithPwm {
         let duty_cycle = DEFAULT_DUTY_CYCLE;
         // Start with range = 255 (default)
         let pin_number = pin.pin() as u32;
-        let conn = block_on(Connection::new()).change_context(PeripheralsError)?;
-        block_on(conn.set_mode(pin_number, apigpio::GpioMode::Output)).change_context(
+        let executor = LocalExecutor::new();
+        let conn = block_on(executor.run(Connection::new())).change_context(PeripheralsError)?;
+        block_on(executor.run(conn.set_mode(pin_number, apigpio::GpioMode::Output))).change_context(
             PeripheralsError
         )?;
-        let wid = init_pio_pwm(&conn, pin_number, frequency, duty_cycle).change_context(
+        let wid = block_on(
+            executor.run(
+                init_pio_pwm(&conn, pin_number, frequency, duty_cycle)
+            )
+        ).change_context(
             PeripheralsError,
         )?;
 
@@ -88,11 +96,12 @@ impl TryFrom<OutputPin> for OutputPinWithPwm {
             duty_cycle: duty_cycle,
             conn: conn,
             wave_id: Some(wid),
+            executor: executor,
         })
     }
 }
 
-fn init_pio_pwm(connection: &Connection, pin: u32, frequency: u32, duty_cycle: f64) -> Result<WaveId, PeripheralsError> {
+async fn init_pio_pwm(connection: &Connection, pin: u32, frequency: u32, duty_cycle: f64) -> Result<WaveId, PeripheralsError> {
     let period = (1. / frequency as f64 * 1_000_000.) as u32;
     let on_pwm = Pulse {
         on_mask: 1 << pin,
@@ -104,9 +113,11 @@ fn init_pio_pwm(connection: &Connection, pin: u32, frequency: u32, duty_cycle: f
         off_mask: 1 << pin,
         us_delay: period - (duty_cycle * period as f64) as u32,
     };
-    let wave_id = block_on(
-        connection.wave_add_generic(vec![on_pwm, off_pwm].as_ref())
-    ).change_context(PeripheralsError)?;
+    let wave_id = 
+        connection
+        .wave_add_generic(vec![on_pwm, off_pwm].as_ref())
+        .await
+        .change_context(PeripheralsError)?;
     Ok(WaveId(wave_id))
 }
 

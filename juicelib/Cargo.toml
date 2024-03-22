@@ -19,4 +19,5 @@ log = "0.4"
 statrs = "0.16.0"
 apigpio = "1.0.1"
 futures = { version = "0.3.30", features = ["futures-executor"] }
+async-executor = "1.8.0"
 # tokio = { version = "1.5", features = ["full"] }
