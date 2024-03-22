@@ -1,15 +1,18 @@
-use std::{sync::{Arc, Mutex}, thread, fmt::{Display, Formatter, self}};
+use std::{error::Error, fmt::{self, Display, Formatter}, sync::{Arc, Mutex}, thread};
+use std::result::Result as StdResult;
 
-use error_stack::{Context, ResultExt, Result, Report};
+use error_stack::{Context, ResultExt, Result, Report, FutureExt};
 ///
 /// Implementation of the peripherals module.
 ///
 
 // use gpio's hal
 use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
+use apigpio::{Connection, PigpiodError, Pulse, WaveId};
+use futures::executor::block_on;
 use crate::{pilot::Pilot, adc::Adc};
 
-use log::debug;
+use log::{debug, info};
 
 #[derive(Debug)]
 pub struct PeripheralsError;
@@ -41,6 +44,9 @@ const GFI_STATUS_PIN: u8 = 22;
 const RELAY_TEST_PIN: u8 = 23;
 const GFI_TEST_PIN: u8 = 24;
 const GFI_RESET_PIN: u8 = 27;
+const DEFAULT_PWM_FREQUENCY: u32 = 10000;
+const DEFAULT_DUTY_CYCLE: f64 = 0.5;
+
 
 pub struct Pins {
     pub contactor_pin: OutputPin,
@@ -48,40 +54,91 @@ pub struct Pins {
     pub relay_test_pin: InputPin,
     pub gfi_test_pin: OutputPin,
     pub gfi_reset_pin: OutputPin,
-    pub power_watchdog_pin: OutputPin,
+    pub power_watchdog_pin: OutputPinWithPwm,
 
     power_watchdog_oscillating: bool,
 }
 
-trait PigPioPwm {
-    fn set_pio_pwm_dc(&mut self, duty_cycle: f64) -> Result<(), PeripheralsError>;
+pub struct OutputPinWithPwm {
+    pin: OutputPin,
+    frequency: u32,
+    duty_cycle: f64,
+    conn: Connection,
+    wave_id: Option<WaveId>,
 }
 
-fn execute_pigs_command(command: &str) -> Result<(), PeripheralsError> {
-    debug!("Executing command: {}", command);
-    let output = std::process::Command::new("pigs")
-        .arg(command)
-        .output()
-        .change_context(PeripheralsError)?;
-    if !output.status.success() {
-        return Err(Report::new(PeripheralsError));
-    }
-    Ok(())
-}
-
-
-impl PigPioPwm for OutputPin {
-    fn set_pio_pwm_dc(&mut self, duty_cycle: f64) -> Result<(), PeripheralsError> {
-        let frequency = 10000;
-        let duty_cycle = duty_cycle;
+impl TryFrom<OutputPin> for OutputPinWithPwm {
+    type Error = Report<PeripheralsError>;
+    fn try_from(pin: OutputPin) -> StdResult<Self, Self::Error> {
+        let frequency = DEFAULT_PWM_FREQUENCY;
+        let duty_cycle = DEFAULT_DUTY_CYCLE;
         // Start with range = 255 (default)
-        let range = (duty_cycle*255.) as u32;
-        let pin = self.pin();
-        for cmd in [format!("pfs {} {}", pin, frequency), format!("p {} {}", pin, range)] {
-            execute_pigs_command(&cmd)?;
+        let pin_number = pin.pin() as u32;
+        let conn = block_on(Connection::new()).change_context(PeripheralsError)?;
+        block_on(conn.set_mode(pin_number, apigpio::GpioMode::Output)).change_context(
+            PeripheralsError
+        )?;
+        let wid = init_pio_pwm(&conn, pin_number, frequency, duty_cycle).change_context(
+            PeripheralsError,
+        )?;
+
+        Ok(Self {
+            pin: pin,
+            frequency: frequency,
+            duty_cycle: duty_cycle,
+            conn: conn,
+            wave_id: Some(wid),
+        })
+    }
+}
+
+fn init_pio_pwm(connection: &Connection, pin: u32, frequency: u32, duty_cycle: f64) -> Result<WaveId, PeripheralsError> {
+    let period = (1. / frequency as f64 * 1_000_000.) as u32;
+    let on_pwm = Pulse {
+        on_mask: 1 << pin,
+        off_mask: 0,
+        us_delay: 0,
+    };
+    let off_pwm = Pulse {
+        on_mask: 0,
+        off_mask: 1 << pin,
+        us_delay: period - (duty_cycle * period as f64) as u32,
+    };
+    let wave_id = block_on(
+        connection.wave_add_generic(vec![on_pwm, off_pwm].as_ref())
+    ).change_context(PeripheralsError)?;
+    Ok(WaveId(wave_id))
+}
+
+trait PigPioPwm {
+    fn start_pio_pwm(&mut self) -> Result<(), PeripheralsError>;
+    fn stop_pio_pwm(&mut self) -> Result<(), PeripheralsError>;
+}
+
+impl PigPioPwm for OutputPinWithPwm {
+    fn start_pio_pwm(&mut self) -> Result<(), PeripheralsError> {
+        let pin_number = self.pin.pin() as u32;
+        info!("Starting PIO PWM on pin {}", pin_number);
+        match self.wave_id {
+            Some(wave_id) => {
+                block_on(self.conn.wave_send_repeat(wave_id)).change_context(PeripheralsError)?;
+            }
+            None => {
+                let wid = init_pio_pwm(&self.conn, pin_number, self.frequency, self.duty_cycle).change_context(PeripheralsError)?;
+                self.wave_id = Some(wid);
+            }
         }
+        
         Ok(())
     }
+
+    fn stop_pio_pwm(&mut self) -> Result<(), PeripheralsError> {
+        let pin_number = self.pin.pin() as u32;
+        info!("Stopping PIO PWM on pin {}", pin_number);
+        block_on(self.conn.wave_tx_stop()).change_context(PeripheralsError)?;
+        Ok(())
+    }
+
 }
 
 pub struct GpioPeripherals {
@@ -118,7 +175,7 @@ impl GpioPeripherals {
             relay_test_pin: relay_test_pin,
             gfi_test_pin: gfi_test_pin,
             gfi_reset_pin: gfi_reset_pin,
-            power_watchdog_pin: power_watchdog_pin,
+            power_watchdog_pin: power_watchdog_pin.try_into().unwrap(),
             power_watchdog_oscillating: false,
         }));
 
@@ -141,10 +198,10 @@ impl GpioPeripherals {
         }
         if oscillate {
             debug!("Oscillating watchdog");
-            pins.power_watchdog_pin.set_pio_pwm_dc(0.5).change_context(PeripheralsError)?;
+            pins.power_watchdog_pin.start_pio_pwm().change_context(PeripheralsError)?;
         } else if pins.power_watchdog_oscillating {
             debug!("Stopping watchdog oscillation");
-            pins.power_watchdog_pin.set_pio_pwm_dc(0.).change_context(PeripheralsError)?;
+            pins.power_watchdog_pin.start_pio_pwm().change_context(PeripheralsError)?;
         }
         pins.power_watchdog_oscillating = oscillate;
         Ok(())

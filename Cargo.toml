@@ -3,3 +3,4 @@ members = [
     "juicelib",
     "juiced",
 ]
+resolver = "2"

@@ -17,4 +17,6 @@ lazy_static = "1.4"
 error-stack = "0.4"
 log = "0.4"
 statrs = "0.16.0"
-
+apigpio = "1.0.1"
+futures = { version = "0.3.30", features = ["futures-executor"] }
+# tokio = { version = "1.5", features = ["full"] }
