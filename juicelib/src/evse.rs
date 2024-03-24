@@ -4,7 +4,7 @@
 // Define the state machine of an AC EVSE:
 
 use core::panic;
-use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, RwLock}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, RwLock}, thread::{self, sleep}, time::Duration};
 
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
@@ -547,6 +547,8 @@ where T: EVSEHardware + Send + Sync
                     },
                     Ok(EVSEMachineInput::SelfTestOk) => {
                         state_input = EVSEMachineInput::SelfTestOk;
+                        info!("Self test passed. Waiting for 5s before starting the machine.");
+                        sleep(Duration::from_secs(5));
                         info!("Self test passed");
                     },
                     Ok(e) => {

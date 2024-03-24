@@ -1,12 +1,12 @@
 use std::{fmt::{self, Display, Formatter}, sync::{Arc, Mutex}, thread};
 use std::result::Result as StdResult;
-use async_executor::LocalExecutor;
+use lazy_static::lazy_static;
 
-use error_stack::{Context, ResultExt, Result, Report};
-use futures::executor::{self, block_on};
-///
-/// Implementation of the peripherals module.
-///
+use error_stack::{Context, ResultExt, Result, Report, FutureExt};
+
+lazy_static! {
+    static ref TOKIO_RT: tokio::runtime::Runtime = tokio::runtime::Runtime::new().unwrap();
+}
 
 // use gpio's hal
 use rppal::gpio::{Gpio, OutputPin, InputPin, Level};
@@ -66,26 +66,24 @@ pub struct OutputPinWithPwm {
     duty_cycle: f64,
     conn: Connection,
     wave_id: Option<WaveId>,
-    executor: LocalExecutor,
 }
 
-/// Run an async function until completion
 impl TryFrom<OutputPin> for OutputPinWithPwm {
     type Error = Report<PeripheralsError>;
     fn try_from(pin: OutputPin) -> StdResult<Self, Self::Error> {
+        let rt = &TOKIO_RT;
         let frequency = DEFAULT_PWM_FREQUENCY;
         let duty_cycle = DEFAULT_DUTY_CYCLE;
         // Start with range = 255 (default)
         let pin_number = pin.pin() as u32;
-        let executor = LocalExecutor::new();
-        let conn = block_on(executor.run(Connection::new())).change_context(PeripheralsError)?;
-        block_on(executor.run(conn.set_mode(pin_number, apigpio::GpioMode::Output))).change_context(
+    
+        let conn = rt.block_on(Connection::new()).change_context(PeripheralsError)?;
+        rt.block_on(conn.wave_clear()).change_context(PeripheralsError)?;
+        rt.block_on(conn.set_mode(pin_number, apigpio::GpioMode::Output)).change_context(
             PeripheralsError
         )?;
-        let wid = block_on(
-            executor.run(
+        let wid = rt.block_on(
                 init_pio_pwm(&conn, pin_number, frequency, duty_cycle)
-            )
         ).change_context(
             PeripheralsError,
         )?;
@@ -96,7 +94,6 @@ impl TryFrom<OutputPin> for OutputPinWithPwm {
             duty_cycle: duty_cycle,
             conn: conn,
             wave_id: Some(wid),
-            executor: executor,
         })
     }
 }
@@ -106,19 +103,22 @@ async fn init_pio_pwm(connection: &Connection, pin: u32, frequency: u32, duty_cy
     let on_pwm = Pulse {
         on_mask: 1 << pin,
         off_mask: 0,
-        us_delay: 0,
+        us_delay: (duty_cycle * period as f64) as u32,
     };
     let off_pwm = Pulse {
         on_mask: 0,
         off_mask: 1 << pin,
         us_delay: period - (duty_cycle * period as f64) as u32,
     };
-    let wave_id = 
-        connection
+    info!("Creating PIO PWM with period: {}, on: {}, off: {}", period, on_pwm.us_delay, off_pwm.us_delay);
+    debug!("Creating PIO PWM with on: {:?}, off: {:?}", on_pwm, off_pwm);
+    connection
         .wave_add_generic(vec![on_pwm, off_pwm].as_ref())
         .await
         .change_context(PeripheralsError)?;
-    Ok(WaveId(wave_id))
+    let wave_id = connection.wave_create().await.change_context(PeripheralsError)?;
+
+    Ok(wave_id)
 }
 
 trait PigPioPwm {
@@ -128,14 +128,15 @@ trait PigPioPwm {
 
 impl PigPioPwm for OutputPinWithPwm {
     fn start_pio_pwm(&mut self) -> Result<(), PeripheralsError> {
+        let rt = &TOKIO_RT;
         let pin_number = self.pin.pin() as u32;
         info!("Starting PIO PWM on pin {}", pin_number);
         match self.wave_id {
             Some(wave_id) => {
-                block_on(self.conn.wave_send_repeat(wave_id)).change_context(PeripheralsError)?;
+                rt.block_on(self.conn.wave_send_repeat(wave_id)).change_context(PeripheralsError)?;
             }
             None => {
-                let wid = init_pio_pwm(&self.conn, pin_number, self.frequency, self.duty_cycle).change_context(PeripheralsError)?;
+                let wid = rt.block_on(init_pio_pwm(&self.conn, pin_number, self.frequency, self.duty_cycle)).change_context(PeripheralsError)?;
                 self.wave_id = Some(wid);
             }
         }
@@ -146,7 +147,7 @@ impl PigPioPwm for OutputPinWithPwm {
     fn stop_pio_pwm(&mut self) -> Result<(), PeripheralsError> {
         let pin_number = self.pin.pin() as u32;
         info!("Stopping PIO PWM on pin {}", pin_number);
-        block_on(self.conn.wave_tx_stop()).change_context(PeripheralsError)?;
+        TOKIO_RT.block_on(self.conn.wave_tx_stop()).change_context(PeripheralsError)?;
         Ok(())
     }
 
@@ -190,6 +191,11 @@ impl GpioPeripherals {
             power_watchdog_oscillating: false,
         }));
 
+        ctrlc::set_handler(move || {
+            let mut new_pilot = Pilot::new().unwrap();
+            new_pilot.set_duty_cycle(0.0).unwrap();
+        }).unwrap();
+
         Self {
             adc: adc,
             pilot: pilot,
@@ -212,7 +218,7 @@ impl GpioPeripherals {
             pins.power_watchdog_pin.start_pio_pwm().change_context(PeripheralsError)?;
         } else if pins.power_watchdog_oscillating {
             debug!("Stopping watchdog oscillation");
-            pins.power_watchdog_pin.start_pio_pwm().change_context(PeripheralsError)?;
+            pins.power_watchdog_pin.stop_pio_pwm().change_context(PeripheralsError)?;
         }
         pins.power_watchdog_oscillating = oscillate;
         Ok(())
