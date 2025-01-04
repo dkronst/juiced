@@ -4,7 +4,7 @@ use juicelib::evse::{start_machine, EVSEHardwareImpl};
 use simplelog::{SimpleLogger, LevelFilter, Config};
 
 fn initiate_logging() {
-    let _ = SimpleLogger::init(LevelFilter::Trace, Config::default());
+    let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
 }
 
 fn main() {

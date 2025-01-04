@@ -408,7 +408,7 @@ impl EVSEHardware for EVSEHardwareImpl {
         }
         self.hw_peripherals.set_contactor_pin(state.clone().into());
         if !oscillate {
-            info!("Stopping power watchdog");
+            debug!("Stopping power watchdog");
             self.hw_peripherals.set_oscillate_watchdog(oscillate).change_context(HwError::HardwareFault)
                     .attach_printable("Failed to stop power watchdog")?;
         }
