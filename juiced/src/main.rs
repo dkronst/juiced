@@ -1,14 +1,8 @@
 
 use juicelib::evse::{start_machine, EVSEHardwareImpl};
 
-use simplelog::{SimpleLogger, LevelFilter, Config};
-
-fn initiate_logging() {
-    let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
-}
-
 fn main() {
-    initiate_logging();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let evse = EVSEHardwareImpl::new();
     start_machine(evse);
 }
