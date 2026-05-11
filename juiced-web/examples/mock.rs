@@ -9,29 +9,26 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use juiced_status::{
-    FsmState, StatusBroker, SupervisorPhase, Waveform, WaveformSample, WaveformTrigger,
+    FsmState, StatusBroker, SupervisorPhase, Waveform, WaveformSample,
 };
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let broker = Arc::new(StatusBroker::new());
-    let trigger = WaveformTrigger::new();
     let reader = broker.reader();
-    let trig_for_web = trigger.clone();
 
     thread::Builder::new()
         .name("juiced-web".to_string())
-        .spawn(move || juiced_web::serve(reader, trig_for_web, 8080))
+        .spawn(move || juiced_web::serve(reader, 8080))
         .expect("spawn web thread");
 
-    // Demo capture worker: when the UI presses Capture, fabricate a
-    // realistic 50-cycle rectified sine and publish it.
+    // Demo continuous capture: publish a fabricated waveform every ~4 s,
+    // mirroring the real ADC thread's pacing.
     let broker_for_capture = Arc::clone(&broker);
-    let trig_for_capture = trigger.clone();
     thread::Builder::new()
         .name("mock-capture".to_string())
-        .spawn(move || demo_capture_worker(broker_for_capture, trig_for_capture))
+        .spawn(move || demo_capture_worker(broker_for_capture))
         .expect("spawn capture worker");
 
     println!();
@@ -114,41 +111,31 @@ fn drive_scenario(broker: Arc<StatusBroker>) -> ! {
     }
 }
 
-fn demo_capture_worker(broker: Arc<StatusBroker>, trigger: WaveformTrigger) -> ! {
+fn demo_capture_worker(broker: Arc<StatusBroker>) -> ! {
     loop {
-        if trigger.take() {
-            log::info!("demo capture: generating fake waveform");
-            // Pretend it took 10 s — match the real ADC thread's pacing.
-            thread::sleep(Duration::from_secs(10));
-            broker.publish_waveform(fabricate_waveform());
-            log::info!("demo capture: published");
-        }
-        thread::sleep(Duration::from_millis(200));
+        // Match the real ADC thread's cadence: a capture takes ~4 s.
+        thread::sleep(Duration::from_secs(4));
+        broker.publish_waveform(fabricate_waveform());
     }
 }
 
-/// 50 windows × 20 ms, each ~250 samples of a 50 Hz half-wave rectified
-/// "almost-sine" with some jitter, so the UI has something interesting to
-/// plot in mock mode.
+/// 200 phase-walked samples of a half-wave-rectified-ish 50 Hz sine, so the
+/// dashboard's WaveformCard has something realistic to render off-Pi.
 fn fabricate_waveform() -> Waveform {
-    let window_count: u32 = 50;
-    let window_ms: u32 = 20;
-    let samples_per_window: u32 = 250;
-    let mut samples = Vec::with_capacity((window_count * samples_per_window) as usize);
-    for w in 0..window_count {
-        let window_start_s = (w as f32) * 0.2;
-        for s in 0..samples_per_window {
-            let t_in_window = (s as f32) / (samples_per_window as f32) * 0.02;
-            let theta = 2.0 * std::f32::consts::PI * (t_in_window / 0.02);
-            // Half-wave rectified-ish: positive lobe full amplitude, negative
-            // lobe a fraction (simulating partial bipolar response).
-            let raw = theta.sin();
-            let amps = if raw >= 0.0 { 16.0 * raw } else { 2.0 * raw };
-            samples.push(WaveformSample {
-                t_s: window_start_s + t_in_window,
-                amps,
-            });
-        }
+    let n: u32 = 200;
+    let mains_period_s: f32 = 1.0 / 50.0;
+    let inter_sample_s: f32 = mains_period_s + mains_period_s / (n as f32);
+    let mut samples = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let t_s = (i as f32) * inter_sample_s;
+        // Phase within one 50 Hz cycle.
+        let phase = (t_s / mains_period_s).fract();
+        let theta = 2.0 * std::f32::consts::PI * phase;
+        let raw = theta.sin();
+        // Asymmetric: positive lobe full amplitude, negative lobe attenuated,
+        // so the operator can clearly see whether the front end is bipolar.
+        let amps = if raw >= 0.0 { 16.0 * raw } else { 2.0 * raw };
+        samples.push(WaveformSample { t_s, amps });
     }
     Waveform {
         captured_at_unix_ms: SystemTime::now()
@@ -156,8 +143,8 @@ fn fabricate_waveform() -> Waveform {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
         samples,
-        window_count,
-        window_ms,
+        samples_per_cycle: n,
+        cycle_period_ms: (mains_period_s * 1000.0) as u32,
         spi_hz: 300_000,
     }
 }

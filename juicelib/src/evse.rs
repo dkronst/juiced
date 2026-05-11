@@ -14,7 +14,7 @@ use log::{info, error, debug};
 
 use crossbeam_channel::{Receiver, Select, bounded};
 
-use juiced_status::{FsmState, StatusBroker, SupervisorPhase, Waveform, WaveformSample, WaveformTrigger};
+use juiced_status::{FsmState, StatusBroker, SupervisorPhase, Waveform, WaveformSample};
 
 use crate::peripherals::GpioPeripherals;
 use crate::sensors::SensorsState;
@@ -339,45 +339,51 @@ fn cause_from_input(input: &EVSEMachineInput) -> Option<FailedStationCause> {
     }
 }
 
-/// Diagnostic capture: 50 contiguous mains-cycle windows anchored 200 ms
-/// apart from a `start` instant. Each window samples the current-sense
-/// channel at the SPI maximum (~250 samples / 20 ms). Total: ~12 k samples
-/// over 10 seconds.
+/// Synchronous-undersampling diagnostic capture.
 ///
-/// The schedule uses absolute deadlines (`start + i * 200 ms`) rather than
-/// `sleep(200 ms)` between windows so jitter doesn't accumulate. A short
-/// busy-wait covers the last ~100 µs to land precisely on each deadline.
-const CAPTURE_WINDOW_COUNT: u32 = 50;
-const CAPTURE_WINDOW_PERIOD: Duration = Duration::from_millis(200);
+/// The MCP3008 over a 300 kHz SPI bus can't sample fast enough to see the
+/// 50 Hz current-sense waveform directly (one cycle is 20 ms; a single SPI
+/// read is ~83 µs — that's only ~240 samples/cycle if we hammered it, but
+/// the ADC thread shares the bus with the pilot and mains channels too).
+///
+/// Instead we use the bandwidth we have *across* many cycles: take one
+/// sample every `(1/50 + 1/(50*N)) s`, where N = `SAMPLES_PER_CYCLE`. The
+/// cumulative drift per sample is `1/(50*N)` = 0.1 ms (at N=200), so over
+/// N samples we walk exactly one full mains cycle of phase. Plot the
+/// samples by `t_s mod (1/50)` and you reconstruct the cycle shape.
+///
+/// At N=200, capture takes 200 × 20.1 ms ≈ 4.02 s.
+const SAMPLES_PER_CYCLE: u32 = 200;
+const MAINS_PERIOD: Duration = Duration::from_micros(20_000); // 50 Hz
 
 fn run_waveform_capture(
     adc: &crate::adc::Adc,
     broker: &Arc<StatusBroker>,
 ) -> std::result::Result<(), crate::adc::AdcError> {
+    // Per-sample interval = mains period + (mains period / N).
+    // At N=200 this is 20 ms + 100 µs = 20 100 µs.
+    let inter_sample = MAINS_PERIOD + MAINS_PERIOD / SAMPLES_PER_CYCLE;
+
     let start = Instant::now();
-    let mut samples: Vec<WaveformSample> = Vec::with_capacity(13_000);
+    let mut samples: Vec<WaveformSample> = Vec::with_capacity(SAMPLES_PER_CYCLE as usize);
 
-    for i in 0..CAPTURE_WINDOW_COUNT {
-        let window_start_instant = start + CAPTURE_WINDOW_PERIOD * i;
-        // Park until the deadline. `thread::sleep` is fine down to ~100 µs;
-        // a short spin covers the last bit precisely.
+    for i in 0..SAMPLES_PER_CYCLE {
+        let target = start + inter_sample * i;
+        // Park until the deadline. `thread::sleep` resolution is ~100 µs on
+        // Linux; the short spin covers the final approach for sub-100 µs
+        // precision, which is what we need to keep the 0.1 ms drift clean.
         let now = Instant::now();
-        if window_start_instant > now {
-            let remaining = window_start_instant - now;
-            if remaining > Duration::from_micros(100) {
-                thread::sleep(remaining - Duration::from_micros(100));
+        if target > now {
+            let remaining = target - now;
+            if remaining > Duration::from_micros(150) {
+                thread::sleep(remaining - Duration::from_micros(150));
             }
-            while Instant::now() < window_start_instant { /* spin */ }
+            while Instant::now() < target { /* spin */ }
         }
 
-        let window_t0 = (window_start_instant - start).as_secs_f32();
-        let window_samples = adc.capture_current_waveform_window(crate::adc::Adc::RMS_WINDOW)?;
-        for (t_in_window, amps) in window_samples {
-            samples.push(WaveformSample {
-                t_s: window_t0 + t_in_window,
-                amps,
-            });
-        }
+        let amps = adc.read_current_sense()?;
+        let t_s = (Instant::now() - start).as_secs_f32();
+        samples.push(WaveformSample { t_s, amps });
     }
 
     let captured_at_unix_ms = std::time::SystemTime::now()
@@ -385,11 +391,17 @@ fn run_waveform_capture(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    // Compute RMS from the same samples (they uniformly cover one cycle of
+    // phase, which is exactly what makes this estimator unbiased).
+    let sum_sq: f64 = samples.iter().map(|s| (s.amps as f64) * (s.amps as f64)).sum();
+    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
+    broker.update_current_amps(rms);
+
     broker.publish_waveform(Waveform {
         captured_at_unix_ms,
         samples,
-        window_count: CAPTURE_WINDOW_COUNT,
-        window_ms: crate::adc::Adc::RMS_WINDOW.as_millis() as u32,
+        samples_per_cycle: SAMPLES_PER_CYCLE,
+        cycle_period_ms: MAINS_PERIOD.as_millis() as u32,
         spi_hz: crate::adc::Adc::SPI_HZ,
     });
     Ok(())
@@ -402,43 +414,23 @@ fn start_adc_thread(
     fault_tx: crossbeam_channel::Sender<Fault>,
     running: Arc<AtomicBool>,
     broker: Arc<StatusBroker>,
-    waveform_trigger: WaveformTrigger,
 ) -> Result<(Receiver<(f32, f32)>, thread::JoinHandle<()>), HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
     let handle = thread::spawn(move || {
+        // Loop pattern: one "normal" iteration (pilot peaks + mains peak, so
+        // the FSM gets fresh inputs) followed by one ~4 s synchronous-
+        // undersampling capture (which also yields the RMS via the same
+        // 200 samples). FSM pilot updates therefore arrive every ~4 s,
+        // which is well within J1772's per-state grace windows.
         loop {
             if !running.load(Ordering::Relaxed) {
                 debug!("ADC thread: shutdown requested, exiting");
                 break;
             }
 
-            // Diagnostic capture path. The UI sets the trigger; we take it
-            // here, freeze the regular sampling cycle for ~10 s while the
-            // capture runs (no other thread touches SPI, so no contention),
-            // then drop back to the normal loop.
-            if waveform_trigger.take() {
-                info!("ADC thread: starting diagnostic waveform capture (10 s)");
-                let locked = match adc.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        error!("ADC mutex poisoned during capture: {:?}", e);
-                        let _ = fault_tx.send(Fault::InternalFaultThreadError);
-                        break;
-                    }
-                };
-                if let Err(e) = run_waveform_capture(&locked, &broker) {
-                    error!("Diagnostic capture failed: {:?}", e);
-                    // Don't fault the FSM for a diagnostic failure — just log
-                    // and resume normal sampling.
-                }
-                drop(locked);
-                info!("ADC thread: capture finished");
-                // Resume normal sampling on the next iteration.
-                continue;
-            }
-
-            let (min, max, current, voltage);
+            // --- Normal sampling pass: pilot + mains. ---
+            let (min, max, voltage);
             {
                 let locked_adc = match adc.lock() {
                     Ok(g) => g,
@@ -448,42 +440,56 @@ fn start_adc_thread(
                         break;
                     }
                 };
-                match (
-                    locked_adc.peak_to_peak_pilot(),
-                    locked_adc.read_current_sense_rms(),
-                    locked_adc.peak_mains_voltage(),
-                ) {
-                    (Ok(p2p), Ok(cs), Ok(mv)) => {
+                match (locked_adc.peak_to_peak_pilot(), locked_adc.peak_mains_voltage()) {
+                    (Ok(p2p), Ok(mv)) => {
                         (min, max) = p2p;
-                        current = cs;
                         voltage = mv;
                         broker.update_pilot_voltage(min, max);
-                        broker.update_current_amps(current);
                         broker.update_mains_voltage(voltage);
-                    },
-                    (p2p, cs, mv) => {
-                        error!("ADC read failed: p2p={:?} cs={:?} mv={:?}", p2p.err(), cs.err(), mv.err());
+                    }
+                    (p2p, mv) => {
+                        error!("ADC read failed: p2p={:?} mv={:?}", p2p.err(), mv.err());
                         let _ = fault_tx.send(Fault::InternalFaultThreadError);
                         break;
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(200));
             if listen_to_pilot.load(Ordering::Relaxed) {
-                if let Err(_) = pilot_tx.send((min, max)) {
+                if pilot_tx.send((min, max)) .is_err() {
                     error!("Pilot channel closed");
                     break;
                 }
             }
-            match sensors_state.write() {
-                Ok(mut locked_sensors_state) => {
-                    locked_sensors_state.add_cs_reading(current as f64);
-                    locked_sensors_state.add_mains_peak_reading(voltage as f64);
-                },
-                Err(e) => {
-                    error!("Sensors state RwLock poisoned: {:?}", e);
-                    let _ = fault_tx.send(Fault::InternalFaultThreadError);
-                    break;
+            if let Ok(mut s) = sensors_state.write() {
+                s.add_mains_peak_reading(voltage as f64);
+            }
+
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // --- Diagnostic capture + RMS via synchronous undersampling. ---
+            {
+                let locked_adc = match adc.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("ADC mutex poisoned during capture: {:?}", e);
+                        let _ = fault_tx.send(Fault::InternalFaultThreadError);
+                        break;
+                    }
+                };
+                if let Err(e) = run_waveform_capture(&locked_adc, &broker) {
+                    error!("Diagnostic capture failed: {:?}", e);
+                    // Don't fault the FSM for a diagnostic failure — keep
+                    // looping. Most likely a transient SPI hiccup.
+                }
+            }
+
+            // Mirror the latest RMS into SensorsState too, so legacy
+            // consumers see fresh data.
+            if let Some(amps) = broker.reader().snapshot().current_amps {
+                if let Ok(mut s) = sensors_state.write() {
+                    s.add_cs_reading(amps as f64);
                 }
             }
         }
@@ -786,7 +792,6 @@ fn enter_safe_state<T: EVSEHardware>(evse: &mut T, listen_to_pilot: &Arc<AtomicB
 pub fn start_machine<T>(
     mut evse: T,
     broker: Arc<StatusBroker>,
-    waveform_trigger: WaveformTrigger,
 ) -> Result<TerminationReason, HwError>
 where T: EVSEHardware + Send + Sync
 {
@@ -807,7 +812,6 @@ where T: EVSEHardware + Send + Sync
         fault_tx.clone(),
         Arc::clone(&running),
         Arc::clone(&broker),
-        waveform_trigger,
     )?;
     let fault_handle = start_fault_thread(
         evse.get_peripherals(),
@@ -947,7 +951,7 @@ const SUPERVISOR_RETRY_DELAY: Duration = Duration::from_secs(20);
 /// - `Safety` faults (true ground fault, no PE wire, GFI self-test failing
 ///   at startup) → enter terminal safe-idle loop. These need human attention;
 ///   spinning on them in software would be unsafe.
-pub fn run_until_fatal(broker: Arc<StatusBroker>, waveform_trigger: WaveformTrigger) -> ! {
+pub fn run_until_fatal(broker: Arc<StatusBroker>) -> ! {
     loop {
         broker.set_supervisor(SupervisorPhase::Initializing);
         let evse = match EVSEHardwareImpl::new() {
@@ -960,7 +964,7 @@ pub fn run_until_fatal(broker: Arc<StatusBroker>, waveform_trigger: WaveformTrig
             }
         };
         broker.set_supervisor(SupervisorPhase::Running);
-        match start_machine(evse, Arc::clone(&broker), waveform_trigger.clone()) {
+        match start_machine(evse, Arc::clone(&broker)) {
             Err(e) => {
                 error!("Thread setup failed: {:?}. Retrying in {:?}.", e, SUPERVISOR_RETRY_DELAY);
                 publish_restarting(&broker, format!("thread setup failed: {:?}", e));

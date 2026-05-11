@@ -144,11 +144,20 @@ impl Adc {
         Ok((sum_sq / count as f64).sqrt() as f32)
     }
 
+    /// Read a single current-sense sample. Public so the synchronous-
+    /// undersampling capture in `juicelib::evse` can schedule its own
+    /// per-sample timing without going through the burst-read primitives.
     #[inline]
-    fn read_current_sense_one_sample(&self) -> Result<f32, AdcError> {
+    pub fn read_current_sense(&self) -> Result<f32, AdcError> {
         let reading = self.mcp.single_ended_read(Self::CURRENT_SENSE_CHANNEL)?;
         let curr = Self::to_amps(reading);
         Ok(curr)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn read_current_sense_one_sample(&self) -> Result<f32, AdcError> {
+        self.read_current_sense()
     }
 
     /// Sample the current-sense channel as fast as the SPI allows for

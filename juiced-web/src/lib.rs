@@ -1,22 +1,22 @@
-//! HTTP dashboard for juiced. Read-only state, plus a single control input
-//! (`POST /api/wave/trigger`) for one-shot diagnostic waveform captures.
+//! HTTP dashboard for juiced. Read-only.
 //!
-//! `serve(reader, trigger, port)` blocks the calling thread. The web exporter
-//! is a pure consumer of `juiced_status::StatusReader` for state, and writes
-//! to `juiced_status::WaveformTrigger` *only* via the explicit trigger
-//! endpoint. It has no dependency on `juicelib` and no awareness of the FSM
-//! internals.
+//! `serve(reader, port)` blocks the calling thread. The web exporter is a
+//! pure consumer of `juiced_status::StatusReader` — it has no dependency on
+//! `juicelib` and no awareness of the FSM internals.
 //!
 //! Routes:
-//!   GET  /                              -> index.html (embedded)
-//!   GET  /api/state                     -> JSON snapshot of Status
-//!   GET  /api/wave                      -> JSON of the latest Waveform (404 if none)
-//!   POST /api/wave/trigger              -> 202 Accepted; flips the WaveformTrigger
-//!   GET  /static/juiced-web-ui_bg.wasm  -> WASM binary (trunk output)
-//!   GET  /static/juiced-web-ui.js       -> trunk-generated WASM loader
-//!   GET  /static/app.css                -> stylesheet
+//!   GET /                              -> index.html (embedded)
+//!   GET /api/state                     -> JSON snapshot of Status
+//!   GET /api/wave                      -> JSON of the latest Waveform (404 if none)
+//!   GET /static/juiced-web-ui_bg.wasm  -> WASM binary (trunk output)
+//!   GET /static/juiced-web-ui.js       -> trunk-generated WASM loader
+//!   GET /static/app.css                -> stylesheet
+//!
+//! Diagnostic waveform captures run continuously in the ADC thread; the
+//! dashboard simply polls `/api/wave` (gated by a freshness check on
+//! `Status.waveform_captured_at_unix_ms`).
 
-use juiced_status::{StatusReader, WaveformTrigger};
+use juiced_status::StatusReader;
 use log::{error, info, warn};
 use tiny_http::{Header, Method, Response, Server};
 
@@ -24,19 +24,15 @@ mod assets;
 
 /// Bind to `0.0.0.0:port` and serve until the server is dropped (never, in
 /// production). Pass `0` to bind an ephemeral port.
-pub fn serve(reader: StatusReader, trigger: WaveformTrigger, port: u16) {
-    serve_with_port_callback(reader, trigger, port, |_| {})
+pub fn serve(reader: StatusReader, port: u16) {
+    serve_with_port_callback(reader, port, |_| {})
 }
 
 /// Like `serve`, but invokes `on_bound` once the server has a real port.
 /// Used by tests that pass `port = 0` and need to discover the ephemeral
 /// port before they can issue HTTP requests.
-pub fn serve_with_port_callback<F>(
-    reader: StatusReader,
-    trigger: WaveformTrigger,
-    port: u16,
-    on_bound: F,
-) where
+pub fn serve_with_port_callback<F>(reader: StatusReader, port: u16, on_bound: F)
+where
     F: FnOnce(u16),
 {
     let addr = format!("0.0.0.0:{}", port);
@@ -80,10 +76,6 @@ pub fn serve_with_port_callback<F>(
                 },
                 None => respond_bytes(request, 404, "text/plain", b"no waveform captured yet"),
             },
-            (Method::Post, "/api/wave/trigger") => {
-                trigger.request();
-                respond_bytes(request, 202, "text/plain", b"capture requested")
-            }
             (Method::Get, "/static/juiced-web-ui_bg.wasm") => {
                 respond_bytes(request, 200, "application/wasm", assets::APP_WASM)
             }
@@ -118,12 +110,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn spawn(broker: &StatusBroker, trigger: &WaveformTrigger) -> u16 {
+    fn spawn(broker: &StatusBroker) -> u16 {
         let reader = broker.reader();
-        let trig = trigger.clone();
         let (port_tx, port_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            serve_with_port_callback(reader, trig, 0, move |bound| {
+            serve_with_port_callback(reader, 0, move |bound| {
                 let _ = port_tx.send(bound);
             });
         });
@@ -144,22 +135,12 @@ mod tests {
         (status, ct, body)
     }
 
-    fn post_empty(port: u16, path: &str) -> u16 {
-        let url = format!("http://127.0.0.1:{}{}", port, path);
-        let resp = ureq::post(&url).send_bytes(&[]).unwrap_or_else(|e| match e {
-            ureq::Error::Status(_, r) => r,
-            other => panic!("HTTP transport error: {:?}", other),
-        });
-        resp.status()
-    }
-
     #[test]
     fn test_api_state_returns_serialized_status() {
         let broker = StatusBroker::new();
         broker.set_fsm_state(FsmState::Charging);
         broker.update_pilot_voltage(-12.0, 6.0);
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
 
         let (status, ct, body) = get(port, "/api/state");
         assert_eq!(status, 200);
@@ -172,8 +153,7 @@ mod tests {
     #[test]
     fn test_root_returns_html_with_wasm_loader() {
         let broker = StatusBroker::new();
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
         let (status, ct, body) = get(port, "/");
         assert_eq!(status, 200);
         assert!(ct.starts_with("text/html"), "wrong content-type: {}", ct);
@@ -186,8 +166,7 @@ mod tests {
     #[test]
     fn test_static_assets_served() {
         let broker = StatusBroker::new();
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
 
         let (wasm_status, wasm_ct, _) = get(port, "/static/juiced-web-ui_bg.wasm");
         assert_eq!(wasm_status, 200);
@@ -205,8 +184,7 @@ mod tests {
     #[test]
     fn test_unknown_path_returns_404() {
         let broker = StatusBroker::new();
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
         let (status, _, _) = get(port, "/nope");
         assert_eq!(status, 404);
     }
@@ -214,8 +192,7 @@ mod tests {
     #[test]
     fn test_serve_reflects_live_status_updates() {
         let broker = StatusBroker::new();
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
 
         let (_, _, body1) = get(port, "/api/state");
         let snap1: Status = serde_json::from_str(&body1).unwrap();
@@ -233,13 +210,13 @@ mod tests {
     fn fake_waveform(ts: u64) -> Waveform {
         Waveform {
             captured_at_unix_ms: ts,
-            window_count: 2,
-            window_ms: 20,
+            samples_per_cycle: 3,
+            cycle_period_ms: 20,
             spi_hz: 300_000,
             samples: vec![
                 WaveformSample { t_s: 0.000, amps: 0.0 },
-                WaveformSample { t_s: 0.010, amps: 1.5 },
-                WaveformSample { t_s: 0.020, amps: 0.0 },
+                WaveformSample { t_s: 0.020, amps: 1.5 },
+                WaveformSample { t_s: 0.040, amps: 0.0 },
             ],
         }
     }
@@ -247,8 +224,7 @@ mod tests {
     #[test]
     fn test_api_wave_returns_404_before_any_capture() {
         let broker = StatusBroker::new();
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
         let (status, _, _) = get(port, "/api/wave");
         assert_eq!(status, 404);
     }
@@ -257,8 +233,7 @@ mod tests {
     fn test_api_wave_returns_published_waveform() {
         let broker = StatusBroker::new();
         broker.publish_waveform(fake_waveform(1700000000123));
-        let trigger = WaveformTrigger::new();
-        let port = spawn(&broker, &trigger);
+        let port = spawn(&broker);
 
         let (status, ct, body) = get(port, "/api/wave");
         assert_eq!(status, 200);
@@ -267,17 +242,5 @@ mod tests {
         assert_eq!(parsed.captured_at_unix_ms, 1700000000123);
         assert_eq!(parsed.samples.len(), 3);
         assert_eq!(parsed.samples[1].amps, 1.5);
-    }
-
-    #[test]
-    fn test_api_wave_trigger_sets_request_flag_and_returns_202() {
-        let broker = StatusBroker::new();
-        let trigger = WaveformTrigger::new();
-        assert!(!trigger.is_requested());
-        let port = spawn(&broker, &trigger);
-
-        let status = post_empty(port, "/api/wave/trigger");
-        assert_eq!(status, 202);
-        assert!(trigger.is_requested(), "trigger flag should be set after POST");
     }
 }

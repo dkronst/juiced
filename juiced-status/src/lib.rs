@@ -52,12 +52,16 @@ pub struct WaveformSample {
     pub amps: f32,
 }
 
-/// A diagnostic snapshot of the current-sense waveform.
+/// A diagnostic snapshot of the current-sense waveform, reconstructed via
+/// **synchronous undersampling**: we sample the current channel at the
+/// mains period (1/50 s) plus a small per-sample drift `dt / samples`, so
+/// after `samples` samples we've walked exactly one full mains cycle of
+/// phase. Each `WaveformSample.t_s` is the real elapsed time; the phase
+/// within a 50 Hz cycle is `t_s mod (cycle_period_ms / 1000)`.
 ///
-/// The capture is composed of `window_count` separate sampling windows
-/// (each `window_ms` ms long, ≈ one 50 Hz mains cycle) at known offsets
-/// from the start. Between windows the ADC thread is idle, so the time
-/// axis has gaps the UI uses to draw cycle boundaries.
+/// This trades capture time (~4 s) for waveform fidelity even at the
+/// MCP3008's slow ~12 k samples/s SPI rate: every phase in the cycle gets
+/// sampled exactly once with high temporal resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Waveform {
     /// Milliseconds since the Unix epoch when the capture *finished*. The
@@ -65,8 +69,10 @@ pub struct Waveform {
     /// fresh capture.
     pub captured_at_unix_ms: u64,
     pub samples: Vec<WaveformSample>,
-    pub window_count: u32,
-    pub window_ms: u32,
+    /// Number of samples spread across one mains cycle's worth of phase.
+    pub samples_per_cycle: u32,
+    /// Base sampling period in ms (= mains period; 20 ms for 50 Hz).
+    pub cycle_period_ms: u32,
     /// SPI clock used during sampling; recorded so the operator can sanity
     /// check the effective sample rate from the data.
     pub spi_hz: u32,
@@ -258,53 +264,6 @@ mod broker_impl {
 #[cfg(not(target_arch = "wasm32"))]
 pub use broker_impl::{StatusBroker, StatusReader};
 
-// ---------------------------------------------------------------------------
-// Waveform capture trigger (native targets only).
-// ---------------------------------------------------------------------------
-
-#[cfg(not(target_arch = "wasm32"))]
-mod trigger_impl {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// One-shot signal from the UI/web layer to the ADC thread: "capture a
-    /// diagnostic waveform next time you get a chance". Cheap to clone; clones
-    /// share the same underlying flag.
-    ///
-    /// Kept separate from `StatusBroker` because the broker is a read-only
-    /// surface for status data — this is a control input.
-    #[derive(Clone, Default)]
-    pub struct WaveformTrigger {
-        flag: Arc<AtomicBool>,
-    }
-
-    impl WaveformTrigger {
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        /// Mark a capture as requested. Idempotent.
-        pub fn request(&self) {
-            self.flag.store(true, Ordering::Relaxed);
-        }
-
-        /// Non-destructively read the current request state.
-        pub fn is_requested(&self) -> bool {
-            self.flag.load(Ordering::Relaxed)
-        }
-
-        /// Atomically read-and-clear. Returns `true` exactly once per
-        /// `request()` call; used by the ADC thread to decide when to
-        /// switch into capture mode.
-        pub fn take(&self) -> bool {
-            self.flag.swap(false, Ordering::Relaxed)
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use trigger_impl::WaveformTrigger;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,16 +382,16 @@ mod tests {
     fn fake_waveform(ts: u64) -> Waveform {
         Waveform {
             captured_at_unix_ms: ts,
-            window_count: 2,
-            window_ms: 20,
+            samples_per_cycle: 6,
+            cycle_period_ms: 20,
             spi_hz: 300_000,
             samples: vec![
-                WaveformSample { t_s: 0.0, amps: 0.0 },
-                WaveformSample { t_s: 0.01, amps: 1.5 },
-                WaveformSample { t_s: 0.02, amps: 0.0 },
-                WaveformSample { t_s: 0.2, amps: 0.0 },
-                WaveformSample { t_s: 0.21, amps: 1.5 },
-                WaveformSample { t_s: 0.22, amps: 0.0 },
+                WaveformSample { t_s: 0.0000, amps: 0.0 },
+                WaveformSample { t_s: 0.0201, amps: 1.5 },
+                WaveformSample { t_s: 0.0402, amps: 0.0 },
+                WaveformSample { t_s: 0.0603, amps: -1.5 },
+                WaveformSample { t_s: 0.0804, amps: 0.0 },
+                WaveformSample { t_s: 0.1005, amps: 1.5 },
             ],
         }
     }
@@ -453,8 +412,8 @@ mod tests {
 
         let got = broker.reader().latest_waveform().expect("waveform present");
         assert_eq!(got.captured_at_unix_ms, wf.captured_at_unix_ms);
-        assert_eq!(got.window_count, 2);
-        assert_eq!(got.window_ms, 20);
+        assert_eq!(got.samples_per_cycle, 6);
+        assert_eq!(got.cycle_period_ms, 20);
         assert_eq!(got.spi_hz, 300_000);
         assert_eq!(got.samples.len(), 6);
         assert_eq!(got.samples[1].amps, 1.5);

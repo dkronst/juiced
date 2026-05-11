@@ -112,11 +112,11 @@ fn StatusView(status: ReadSignal<Option<Status>>) -> impl IntoView {
 #[component]
 fn WaveformCard(status: ReadSignal<Option<Status>>) -> impl IntoView {
     let (waveform, set_waveform) = signal::<Option<Waveform>>(None);
-    let (capture_in_progress, set_capture_in_progress) = signal(false);
 
-    // When `Status.waveform_captured_at_unix_ms` changes, GET /api/wave once.
-    // Effect re-runs each time the signal it reads changes; returns the
-    // previously-seen timestamp so we can compare on the next tick.
+    // The ADC thread captures continuously (~4 s per capture). Whenever
+    // `Status.waveform_captured_at_unix_ms` advances, fetch the new
+    // payload and re-render. Effect re-runs each time the status signal
+    // changes; the closure receives the previously-returned value.
     Effect::new(move |prev: Option<Option<u64>>| {
         let ts = status.get().and_then(|s| s.waveform_captured_at_unix_ms);
         let prev_ts = prev.flatten();
@@ -125,7 +125,6 @@ fn WaveformCard(status: ReadSignal<Option<Status>>) -> impl IntoView {
                 if let Ok(resp) = Request::get("/api/wave").send().await {
                     if let Ok(wf) = resp.json::<Waveform>().await {
                         set_waveform.set(Some(wf));
-                        set_capture_in_progress.set(false);
                     }
                 }
             });
@@ -133,38 +132,21 @@ fn WaveformCard(status: ReadSignal<Option<Status>>) -> impl IntoView {
         ts
     });
 
-    let on_capture_click = move |_| {
-        if capture_in_progress.get() {
-            return;
-        }
-        set_capture_in_progress.set(true);
-        spawn_local(async move {
-            if Request::post("/api/wave/trigger").send().await.is_err() {
-                set_capture_in_progress.set(false);
-            }
-        });
-    };
-
     view! {
         <div class="card">
             <div class="state-row" style="justify-content:space-between;display:flex;width:100%">
                 <span class="label">"Current-sense waveform"</span>
-                <button
-                    on:click=on_capture_click
-                    disabled=move || capture_in_progress.get()
-                    style="padding:0.4rem 0.9rem;border-radius:0.5rem;border:1px solid var(--border);background:var(--accent);color:white;font-weight:500;cursor:pointer"
-                >
-                    {move || if capture_in_progress.get() {
-                        "Capturing… (10 s)"
-                    } else {
-                        "Capture (10 s)"
+                <span class="muted" style="font-size:0.8rem">
+                    {move || match waveform.get() {
+                        Some(_) => "auto-captured continuously",
+                        None => "waiting for first capture…",
                     }}
-                </button>
+                </span>
             </div>
             <div style="margin-top:1rem">
                 {move || match waveform.get() {
                     None => view! {
-                        <p class="muted">"Press Capture to record 50 mains cycles (10 s)."</p>
+                        <p class="muted">"Capture in progress (≈ 4 s)…"</p>
                     }.into_any(),
                     Some(wf) => render_waveform(&wf).into_any(),
                 }}
@@ -173,20 +155,36 @@ fn WaveformCard(status: ReadSignal<Option<Status>>) -> impl IntoView {
     }
 }
 
-/// Render a captured waveform as a single SVG containing one `<polyline>`
-/// per contiguous segment (the 50 capture windows have ~180 ms gaps between
-/// them, which we split on so the line doesn't draw horizontal jumps).
+/// Render a captured waveform as a single SVG `<polyline>`. The X-axis is
+/// phase within one mains cycle (0..cycle_period_ms), computed by mod-ing
+/// each sample's `t_s`. Synchronous-undersampling already places samples
+/// uniformly across the cycle, so this gives a clean reconstruction of
+/// the AC waveform's shape.
 fn render_waveform(wf: &Waveform) -> impl IntoView {
     if wf.samples.is_empty() {
         return view! { <p class="muted">"Empty waveform."</p> }.into_any();
     }
 
-    // X domain: 0 .. last_t. Y domain: amps min..max, padded a bit.
-    let t_max = wf.samples.iter().map(|s| s.t_s).fold(f32::MIN, f32::max).max(0.001);
+    let cycle_s = (wf.cycle_period_ms as f32) / 1000.0;
+
+    // Compute phase for each sample and sort by phase so the polyline draws
+    // a clean reconstructed cycle (sample order in time is already monotone
+    // in phase since cumulative drift is +0.1 ms/sample, but we sort
+    // defensively in case of jitter or a non-monotonic capture).
+    let mut points: Vec<(f32, f32)> = wf
+        .samples
+        .iter()
+        .map(|s| {
+            let phase_s = s.t_s - cycle_s * (s.t_s / cycle_s).floor();
+            (phase_s, s.amps)
+        })
+        .collect();
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // X domain: 0..cycle_s (in ms for display). Y domain: data min/max, padded.
     let mut a_min = wf.samples.iter().map(|s| s.amps).fold(f32::INFINITY, f32::min);
     let mut a_max = wf.samples.iter().map(|s| s.amps).fold(f32::NEG_INFINITY, f32::max);
     if (a_max - a_min).abs() < 0.001 {
-        // Constant signal; pad so the line is visible.
         a_min -= 0.5;
         a_max += 0.5;
     }
@@ -197,47 +195,30 @@ fn render_waveform(wf: &Waveform) -> impl IntoView {
     // Layout
     let view_w: f32 = 1000.0;
     let view_h: f32 = 280.0;
-    let margin_l: f32 = 50.0;
-    let margin_r: f32 = 10.0;
+    let margin_l: f32 = 56.0;
+    let margin_r: f32 = 12.0;
     let margin_t: f32 = 10.0;
-    let margin_b: f32 = 25.0;
+    let margin_b: f32 = 28.0;
     let plot_w = view_w - margin_l - margin_r;
     let plot_h = view_h - margin_t - margin_b;
 
-    let map_x = |t: f32| margin_l + (t / t_max) * plot_w;
-    let map_y = |a: f32| {
+    let map_x = move |phase_s: f32| margin_l + (phase_s / cycle_s) * plot_w;
+    let map_y = move |a: f32| {
         margin_t + plot_h * (1.0 - (a - a_min_padded) / (a_max_padded - a_min_padded))
     };
 
-    // Build segments: split when the time gap between consecutive samples
-    // exceeds 1 ms (the within-window step is ~0.1 ms; between-window is
-    // ~180 ms). Each segment is a "points" string for one <polyline>.
-    let mut segments: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut last_t: Option<f32> = None;
-    for s in &wf.samples {
-        let gap = match last_t {
-            Some(prev) => s.t_s - prev,
-            None => 0.0,
-        };
-        if gap > 0.001 && !current.is_empty() {
-            segments.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(&format!("{:.1},{:.1}", map_x(s.t_s), map_y(s.amps)));
-        last_t = Some(s.t_s);
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
+    let poly_points: String = points
+        .iter()
+        .map(|(p, a)| format!("{:.1},{:.1}", map_x(*p), map_y(*a)))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let zero_y = map_y(0.0);
     let zero_in_view = a_min_padded <= 0.0 && a_max_padded >= 0.0;
+    let cycle_ms_display = wf.cycle_period_ms as f32;
     let stats = format!(
-        "{} samples across {} windows × {} ms; SPI {} Hz; range {:.2} A … {:.2} A",
-        wf.samples.len(), wf.window_count, wf.window_ms, wf.spi_hz, a_min, a_max,
+        "{} samples × {:.1} ms cycle (50 Hz mains); SPI {} Hz; range {:.2} A … {:.2} A",
+        wf.samples_per_cycle, cycle_ms_display, wf.spi_hz, a_min, a_max,
     );
 
     view! {
@@ -245,12 +226,12 @@ fn render_waveform(wf: &Waveform) -> impl IntoView {
             viewBox=format!("0 0 {} {}", view_w, view_h)
             style="width:100%;height:auto;background:rgba(0,0,0,0.03);border-radius:0.5rem"
         >
-            // Y-axis labels: top, zero (if present), bottom.
+            // Y-axis tick labels: top, bottom (and zero, if it's in range).
             <text x="6" y=format!("{:.1}", margin_t + 10.0) style="font-size:10px;fill:var(--muted)">
-                {format!("{:.1} A", a_max_padded)}
+                {format!("{:.2} A", a_max_padded)}
             </text>
             <text x="6" y=format!("{:.1}", margin_t + plot_h - 2.0) style="font-size:10px;fill:var(--muted)">
-                {format!("{:.1} A", a_min_padded)}
+                {format!("{:.2} A", a_min_padded)}
             </text>
             {move || if zero_in_view {
                 view! {
@@ -284,13 +265,21 @@ fn render_waveform(wf: &Waveform) -> impl IntoView {
                 stroke="var(--border)"
                 stroke-width="0.5"
             />
-            // X tick at 0 and t_max
+            // X-axis labels: 0 ms, mid, full cycle.
             <text
                 x=format!("{:.1}", margin_l)
                 y=format!("{:.1}", margin_t + plot_h + 14.0)
                 style="font-size:10px;fill:var(--muted)"
             >
-                "0 s"
+                "0 ms"
+            </text>
+            <text
+                x=format!("{:.1}", margin_l + plot_w / 2.0)
+                y=format!("{:.1}", margin_t + plot_h + 14.0)
+                text-anchor="middle"
+                style="font-size:10px;fill:var(--muted)"
+            >
+                {format!("{:.0} ms (½ cycle)", cycle_ms_display / 2.0)}
             </text>
             <text
                 x=format!("{:.1}", margin_l + plot_w)
@@ -298,19 +287,14 @@ fn render_waveform(wf: &Waveform) -> impl IntoView {
                 text-anchor="end"
                 style="font-size:10px;fill:var(--muted)"
             >
-                {format!("{:.1} s", t_max)}
+                {format!("{:.0} ms (1 cycle)", cycle_ms_display)}
             </text>
-            // Segments as separate polylines.
-            {segments.into_iter().map(|pts| {
-                view! {
-                    <polyline
-                        points=pts
-                        fill="none"
-                        stroke="var(--accent)"
-                        stroke-width="1"
-                    />
-                }
-            }).collect_view()}
+            <polyline
+                points=poly_points
+                fill="none"
+                stroke="var(--accent)"
+                stroke-width="1.5"
+            />
         </svg>
         <p class="muted" style="margin-top:0.5rem;font-size:0.8rem">
             {stats}
@@ -418,16 +402,18 @@ mod tests {
             "captured_at_unix_ms":1700000000000,
             "samples":[
                 {"t_s":0.0,"amps":0.0},
-                {"t_s":0.01,"amps":1.5},
-                {"t_s":0.02,"amps":0.0}
+                {"t_s":0.0201,"amps":1.5},
+                {"t_s":0.0402,"amps":0.0}
             ],
-            "window_count":1,
-            "window_ms":20,
+            "samples_per_cycle":3,
+            "cycle_period_ms":20,
             "spi_hz":300000
         }"#;
         let wf: Waveform = serde_json::from_str(json).expect("parse waveform");
         assert_eq!(wf.captured_at_unix_ms, 1700000000000);
         assert_eq!(wf.samples.len(), 3);
         assert_eq!(wf.samples[1].amps, 1.5);
+        assert_eq!(wf.samples_per_cycle, 3);
+        assert_eq!(wf.cycle_period_ms, 20);
     }
 }
