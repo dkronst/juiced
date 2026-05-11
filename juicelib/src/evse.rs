@@ -261,16 +261,78 @@ impl std::fmt::Display for HwError {
     }
 }
 
+/// Why the FSM landed in `FailedStation`. Recorded by `start_machine` from
+/// the last input it consumed before the transition, and used by the
+/// supervisor to decide whether to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedStationCause {
+    HardwareFault,
+    GFIInterrupted,
+    NoGround,
+    SelfTestFailed,
+}
+
+/// Real safety / installation problems that an in-process restart cannot fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyFault {
+    GroundFault,
+    NoGround,
+    SelfTestFailed,
+}
+
+/// Why `start_machine` returned. The supervisor in `run_until_fatal`
+/// translates this into "retry after 20 s" vs "hold safe-idle forever".
+#[derive(Debug)]
+pub enum TerminationReason {
+    /// EVSE-side problem we believe a full re-init will clear (transient SPI
+    /// glitch, stuck rppal handle, internal thread blew up, etc.).
+    Restartable(HwError),
+    /// Real safety event or install issue — software re-init cannot help.
+    Safety(SafetyFault),
+}
+
+/// Classify a `FailedStation` entry. Pure function so the supervisor's
+/// decision logic can be unit-tested without spawning threads.
+fn classify_failed_station(cause: Option<FailedStationCause>) -> TerminationReason {
+    match cause {
+        Some(FailedStationCause::HardwareFault) => TerminationReason::Restartable(HwError::HardwareFault),
+        Some(FailedStationCause::GFIInterrupted) => TerminationReason::Safety(SafetyFault::GroundFault),
+        Some(FailedStationCause::NoGround) => TerminationReason::Safety(SafetyFault::NoGround),
+        Some(FailedStationCause::SelfTestFailed) => TerminationReason::Safety(SafetyFault::SelfTestFailed),
+        // Reaching FailedStation without a known cause shouldn't happen, but
+        // if it does, prefer restart-and-recover over locking out the station.
+        None => TerminationReason::Restartable(HwError::HardwareFault),
+    }
+}
+
+/// Inspect an input being fed to the FSM and record it if it can drive a
+/// transition into `FailedStation`. Used by `start_machine` to remember
+/// *why* we ended up there.
+fn cause_from_input(input: &EVSEMachineInput) -> Option<FailedStationCause> {
+    match input {
+        EVSEMachineInput::HardwareFault => Some(FailedStationCause::HardwareFault),
+        EVSEMachineInput::GFIInterrupted => Some(FailedStationCause::GFIInterrupted),
+        EVSEMachineInput::NoGround => Some(FailedStationCause::NoGround),
+        EVSEMachineInput::SelfTestFailed => Some(FailedStationCause::SelfTestFailed),
+        _ => None,
+    }
+}
+
 fn start_adc_thread(
     periph: &mut GpioPeripherals,
     listen_to_pilot: Arc<AtomicBool>,
     sensors_state: Arc<RwLock<SensorsState>>,
     fault_tx: crossbeam_channel::Sender<Fault>,
-) -> Result<Receiver<(f32, f32)>, HwError> {
+    running: Arc<AtomicBool>,
+) -> Result<(Receiver<(f32, f32)>, thread::JoinHandle<()>), HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         loop {
+            if !running.load(Ordering::Relaxed) {
+                debug!("ADC thread: shutdown requested, exiting");
+                break;
+            }
             let (min, max, current, voltage);
             {
                 let locked_adc = match adc.lock() {
@@ -318,20 +380,22 @@ fn start_adc_thread(
             }
         }
     });
-    Ok(pilot_rx)
+    Ok((pilot_rx, handle))
 }
 
 fn start_fault_thread(
     periph: &mut GpioPeripherals,
     fault_tx: crossbeam_channel::Sender<Fault>,
-) -> Result<(), HwError> {
+    running: Arc<AtomicBool>,
+) -> Result<thread::JoinHandle<()>, HwError> {
     let pins = periph.get_pins();
 
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         // The interrupt closure pushes a unit token onto this channel; the
-        // loop blocks on `recv`. Channels queue, so notifications fired
-        // before the loop reaches `recv` are *not* lost the way a condvar's
-        // would have been.
+        // loop polls it via `recv_timeout` so we can check the shutdown flag
+        // periodically. Channels queue, so notifications fired before the
+        // loop reaches its next `recv_timeout` are *not* lost the way a
+        // condvar's would have been.
         let (event_tx, event_rx) = bounded::<()>(16);
         let res = || -> Result<(), HwError> {
             // Install the interrupt exactly once. Repeatedly re-installing
@@ -353,10 +417,18 @@ fn start_fault_thread(
             }
 
             loop {
-                event_rx.recv().map_err(|e| {
-                    Report::new(HwError::PoisonError)
-                        .attach_printable(format!("gfi event channel closed: {:?}", e))
-                })?;
+                if !running.load(Ordering::Relaxed) {
+                    debug!("Fault thread: shutdown requested, exiting");
+                    return Ok(());
+                }
+                match event_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(()) => {},
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Err(Report::new(HwError::PoisonError)
+                            .attach_printable("gfi event channel disconnected"));
+                    }
+                }
                 let (gfi_status, contactor) = {
                     let locked_pins = pins.lock()
                         .map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
@@ -378,7 +450,7 @@ fn start_fault_thread(
         }
     });
 
-    Ok(())
+    Ok(handle)
 }
 
 
@@ -589,23 +661,48 @@ where T: EVSEHardware
     Ok(next_state_input)
 }
 
-pub fn start_machine<T>(mut evse: T) -> Result<(), HwError>
+/// Open the contactor, drive the pilot to −12 V (offer = 0 A), and stop the
+/// pilot-listening atomic. Used both on entering `FailedStation` and on any
+/// early-return path so the hardware is in a known safe state before the
+/// supervisor drops it.
+fn enter_safe_state<T: EVSEHardware>(evse: &mut T, listen_to_pilot: &Arc<AtomicBool>) {
+    if let Err(e) = evse.set_contactor(OnOff::Off) {
+        error!("safe-state: failed to open contactor: {:?}", e);
+    }
+    if let Err(e) = evse.set_current_offer_ampere(0.0) {
+        error!("safe-state: failed to drive pilot to error: {:?}", e);
+    }
+    listen_to_pilot.store(false, Ordering::Relaxed);
+}
+
+pub fn start_machine<T>(mut evse: T) -> Result<TerminationReason, HwError>
 where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
     let listen_to_pilot = Arc::new(AtomicBool::new(false));
     let sensor_state = Arc::new(RwLock::new(SensorsState::new()));
+    let running = Arc::new(AtomicBool::new(true));
 
     let (fault_tx, fault_chan) = bounded::<Fault>(16);
-    let pilot_voltage_chan = start_adc_thread(
+    let (pilot_voltage_chan, adc_handle) = start_adc_thread(
         evse.get_peripherals(),
         Arc::clone(&listen_to_pilot),
         Arc::clone(&sensor_state),
         fault_tx.clone(),
+        Arc::clone(&running),
     )?;
-    start_fault_thread(evse.get_peripherals(), fault_tx)?;
+    let fault_handle = start_fault_thread(
+        evse.get_peripherals(),
+        fault_tx,
+        Arc::clone(&running),
+    )?;
 
-    loop {
+    // Why we last transitioned (or attempted to transition) into a failing
+    // state. Captured from the most recent input fed to the FSM that maps to
+    // a FailedStation transition.
+    let mut last_failure_cause: Option<FailedStationCause> = None;
+
+    let reason: TerminationReason = loop {
         let state_input: EVSEMachineInput;
         match machine.state() {
             EVSEMachineState::SelfTest => {
@@ -638,24 +735,14 @@ where T: EVSEHardware + Send + Sync
                 );
             },
             EVSEMachineState::FailedStation => {
-                error!("Station failed. Full reset required, contact admin if the issue persists.");
-                // Safe idle: hold the process alive instead of crashing into a 60 s
-                // systemd restart cycle. Contactor off, pilot to error (-12 V), watchdog off.
-                if let Err(e) = evse.set_contactor(OnOff::Off) {
-                    error!("FailedStation: failed to open contactor: {:?}", e);
-                }
-                if let Err(e) = evse.get_peripherals().set_pilot_ampere(0.0) {
-                    error!("FailedStation: failed to drive pilot to error: {:?}", e);
-                }
-                listen_to_pilot.store(false, Ordering::Relaxed);
-                loop {
-                    thread::sleep(Duration::from_secs(60));
-                }
+                error!("Station failed. Entering safe state and returning to supervisor.");
+                enter_safe_state(&mut evse, &listen_to_pilot);
+                break classify_failed_station(last_failure_cause);
             },
             state => {
                 // Measure pilot voltage and feed the machine
                 // pilot measurements are done on another thread. If a timeout
-                // occurs, the machine will be fed with a PilotInError input and 
+                // occurs, the machine will be fed with a PilotInError input and
                 // any charging will be stopped immediately.
                 // Other possible inputs here are:
                 // - GFIInterrupted
@@ -664,11 +751,11 @@ where T: EVSEHardware + Send + Sync
                 // a faulty installation or a hardware failure.
 
                 // select on 2 channels - one for the pilot voltage and one for the
-                // GFI/NoGround errors. The latter are performed by listening to GPIOs 
+                // GFI/NoGround errors. The latter are performed by listening to GPIOs
                 // while the former is done every 10ms (at most) by the pilot measurement thread.
-                // We will decide on a pilot error, or we'll get one from the channel if 
+                // We will decide on a pilot error, or we'll get one from the channel if
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
-                
+
                 let res = do_state_transition(state, &mut evse, &listen_to_pilot);
                 match res {
                     Err(e) => {
@@ -676,7 +763,7 @@ where T: EVSEHardware + Send + Sync
                         state_input = EVSEMachineInput::HardwareFault;
                         // Turn off the contactor, if we fail, we'll try again in the state transition
                         // This is anyway only a secondary safety measure, since the hardware is already hard-wired
-                        // to turn off the contactor immediately if a something dangerous happens (no software), 
+                        // to turn off the contactor immediately if a something dangerous happens (no software),
                         // such as GFI for example.
                         if let Err(e2) = evse.set_contactor(OnOff::Off) {
                             error!("Failed to open contactor on fault path: {:?}", e2);
@@ -698,12 +785,73 @@ where T: EVSEHardware + Send + Sync
                 }
             }
         }
+        // Record the reason if this input is one that drives us into
+        // FailedStation. The supervisor uses this to decide retry vs. lockout.
+        if let Some(cause) = cause_from_input(&state_input) {
+            last_failure_cause = Some(cause);
+        }
         debug!("State input: {:?}", state_input);
         // TODO: Don't perform state change if there is no transition
         let output = machine.consume(&state_input);
         debug!("Output: {:?}", output);
         debug!("State: {:?}", machine.state());
-    } // loop
+    };
+
+    // Signal shutdown and join threads so the hardware Arcs they hold drop
+    // before our caller releases EVSEHardwareImpl. Without this the rppal
+    // Pwm/Spi handles would stay open and the next re-init would fail.
+    running.store(false, Ordering::Relaxed);
+    if let Err(e) = adc_handle.join() {
+        error!("ADC thread panicked during shutdown: {:?}", e);
+    }
+    if let Err(e) = fault_handle.join() {
+        error!("Fault thread panicked during shutdown: {:?}", e);
+    }
+    Ok(reason)
+}
+
+/// Fixed delay between in-process restart attempts. Long enough for the
+/// J1772 vehicle to observe pilot = −12 V and disengage, short enough to
+/// recover from transient SPI / pigpio blips without operator intervention.
+const SUPERVISOR_RETRY_DELAY: Duration = Duration::from_secs(20);
+
+/// Supervisor entry point. Owns the lifecycle of `EVSEHardwareImpl` and the
+/// FSM. Re-initializes the hardware in-process on restartable faults rather
+/// than relying on systemd's 60 s restart cycle. Never returns.
+///
+/// - `Restartable` faults (transient SPI, GPIO acquire race, internal thread
+///   error, GFI-test hardware fault during charging) → drop hardware, sleep
+///   20 s, re-init.
+/// - `Safety` faults (true ground fault, no PE wire, GFI self-test failing
+///   at startup) → enter terminal safe-idle loop. These need human attention;
+///   spinning on them in software would be unsafe.
+pub fn run_until_fatal() -> ! {
+    loop {
+        let evse = match EVSEHardwareImpl::new() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("EVSE init failed: {:?}. Retrying in {:?}.", e, SUPERVISOR_RETRY_DELAY);
+                thread::sleep(SUPERVISOR_RETRY_DELAY);
+                continue;
+            }
+        };
+        match start_machine(evse) {
+            Err(e) => {
+                error!("Thread setup failed: {:?}. Retrying in {:?}.", e, SUPERVISOR_RETRY_DELAY);
+                thread::sleep(SUPERVISOR_RETRY_DELAY);
+            }
+            Ok(TerminationReason::Restartable(e)) => {
+                error!("Restartable EVSE fault: {:?}. Restarting in {:?}.", e, SUPERVISOR_RETRY_DELAY);
+                thread::sleep(SUPERVISOR_RETRY_DELAY);
+            }
+            Ok(TerminationReason::Safety(fault)) => {
+                error!("Non-restartable safety fault: {:?}. Holding safe-idle until human reset.", fault);
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1049,5 +1197,86 @@ mod tests {
             "Closed pilot channel should yield HardwareFault, not {:?}",
             input
         );
+    }
+
+    // ----- Supervisor classification (in-process restart) -----
+
+    #[test]
+    fn test_classify_hardware_fault_is_restartable() {
+        let reason = classify_failed_station(Some(FailedStationCause::HardwareFault));
+        assert!(
+            matches!(reason, TerminationReason::Restartable(HwError::HardwareFault)),
+            "HardwareFault should restart; got {:?}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_classify_ground_fault_is_safety() {
+        // A GFIInterrupted only reaches the FSM when the contactor was on
+        // (the fault thread filters out otherwise), so it always means a real
+        // ground fault. The supervisor must not retry — a person needs to
+        // investigate the install.
+        let reason = classify_failed_station(Some(FailedStationCause::GFIInterrupted));
+        assert!(
+            matches!(reason, TerminationReason::Safety(SafetyFault::GroundFault)),
+            "GFIInterrupted should be a Safety(GroundFault); got {:?}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_classify_no_ground_is_safety() {
+        let reason = classify_failed_station(Some(FailedStationCause::NoGround));
+        assert!(
+            matches!(reason, TerminationReason::Safety(SafetyFault::NoGround)),
+            "NoGround should be a Safety(NoGround); got {:?}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_classify_self_test_failed_is_safety() {
+        let reason = classify_failed_station(Some(FailedStationCause::SelfTestFailed));
+        assert!(
+            matches!(reason, TerminationReason::Safety(SafetyFault::SelfTestFailed)),
+            "SelfTestFailed should be a Safety(SelfTestFailed); got {:?}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_classify_unknown_cause_is_restartable() {
+        // Defensive: if we somehow get to FailedStation without a recorded
+        // cause, the supervisor should retry rather than lock the station out.
+        let reason = classify_failed_station(None);
+        assert!(
+            matches!(reason, TerminationReason::Restartable(_)),
+            "Unknown cause should default to Restartable; got {:?}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_cause_from_input_covers_failed_station_inputs() {
+        assert_eq!(
+            cause_from_input(&EVSEMachineInput::HardwareFault),
+            Some(FailedStationCause::HardwareFault)
+        );
+        assert_eq!(
+            cause_from_input(&EVSEMachineInput::GFIInterrupted),
+            Some(FailedStationCause::GFIInterrupted)
+        );
+        assert_eq!(
+            cause_from_input(&EVSEMachineInput::NoGround),
+            Some(FailedStationCause::NoGround)
+        );
+        assert_eq!(
+            cause_from_input(&EVSEMachineInput::SelfTestFailed),
+            Some(FailedStationCause::SelfTestFailed)
+        );
+        // Vehicle-driven inputs should NOT map to a FailedStationCause.
+        assert_eq!(cause_from_input(&EVSEMachineInput::PilotIs9V), None);
+        assert_eq!(cause_from_input(&EVSEMachineInput::PilotInError), None);
     }
 }
