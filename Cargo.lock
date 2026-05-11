@@ -525,6 +525,7 @@ dependencies = [
 name = "juiced-web"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "juiced-status",
  "log",
  "serde_json",

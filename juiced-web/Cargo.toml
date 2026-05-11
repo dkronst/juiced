@@ -11,3 +11,4 @@ log = "0.4"
 
 [dev-dependencies]
 ureq = { version = "2", default-features = false }
+env_logger = "0.11"
