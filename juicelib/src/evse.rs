@@ -726,6 +726,10 @@ mod tests {
         let output = machine.consume(&EVSEMachineInput::PilotIs6V).unwrap();
         info!("Output: {:?}", output.unwrap());
         info!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::StartCharging));
+        let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Charging));
     }
 
@@ -760,10 +764,18 @@ mod tests {
         let output = machine.consume(&EVSEMachineInput::PilotIs6V).unwrap();
         info!("Output: {:?}", output.unwrap());
         info!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::StartCharging));
+        let output = machine.consume(&EVSEMachineInput::SelfTestOk).unwrap();
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::Charging));
         let output = machine.consume(&EVSEMachineInput::PilotIs9V).unwrap();
         info!("Output: {:?}", output.unwrap());
         info!("State: {:?}", machine.state());
-        assert!(matches!(machine.state(), EVSEMachineState::VehicleDetected));
+        assert!(matches!(machine.state(), EVSEMachineState::StopCharging));
+        let output = machine.consume(&EVSEMachineInput::ChargingFinished).unwrap();
+        info!("Output: {:?}", output.unwrap());
+        info!("State: {:?}", machine.state());
+        assert!(matches!(machine.state(), EVSEMachineState::NoPower));
     }
 }
