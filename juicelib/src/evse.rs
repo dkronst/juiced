@@ -176,12 +176,14 @@ pub enum Fault {
 
 fn get_pilot_state(min_max: (f32, f32)) -> EVSEMachineInput {
     let (vm12, voltage) = min_max;
-    // Missing-diode / oscillating-pilot integrity check: when the pilot is
-    // oscillating (i.e. we are offering charging), the minimum must reach
-    // near -12 V. A negative-but-shallow minimum (e.g. -5 V) means the
-    // protection diode is gone. Only enforce when the max is positive so we
-    // do not flag a steady -12 V fault-state pilot.
-    if voltage > 0.0 && vm12 > -11.0 {
+    // Missing-diode / oscillating-pilot integrity check. Only fires when the
+    // pilot has actually swung negative but not enough to reach -12 V —
+    // that's the missing-diode failure mode (oscillation present, no diode
+    // clipping). Crucially, do NOT fire when `vm12 >= 0`: in `Standby` and
+    // `VehicleDetected` the pilot is steady at +12 V or +9 V (vehicle pulled
+    // down via 2740 Ω), so `min == max == positive`. Treating that as an
+    // error wedges the FSM in `Standby`.
+    if vm12 < 0.0 && vm12 > -11.0 {
         info!("Pilot minimum voltage is out of range: {}", vm12);
         return EVSEMachineInput::PilotInError;
     }
@@ -1171,6 +1173,34 @@ mod tests {
             "VentilationNeeded should not return HwError. result = {:?}\nevents = {:?}",
             result, mock.events,
         );
+    }
+
+    /// Regression for the on-Pi report: in `Standby`, the EVSE drives the
+    /// pilot to a steady +12 V; a connected vehicle pulls it down via its
+    /// 2740 Ω resistor to a steady +9 V. Both `min` and `max` are positive
+    /// and equal — the pilot is NOT oscillating yet. If we treat that as
+    /// `PilotInError` the FSM never transitions out of `Standby` even
+    /// though `PilotIs9V` is exactly what should fire.
+    #[test]
+    fn test_steady_positive_pilot_not_classified_as_pilot_error() {
+        // Real-world reading from the Pi: 8.9 V min and max, vehicle attached
+        // in Status B, no offer yet.
+        let input = get_pilot_state((8.9, 8.9));
+        assert!(
+            matches!(input, EVSEMachineInput::PilotIs9V),
+            "8.9V steady pilot must classify as PilotIs9V, got {:?}",
+            input
+        );
+        // Nominal 9 V steady.
+        assert!(matches!(
+            get_pilot_state((9.0, 9.0)),
+            EVSEMachineInput::PilotIs9V
+        ));
+        // 12 V steady — no vehicle attached.
+        assert!(matches!(
+            get_pilot_state((12.0, 12.0)),
+            EVSEMachineInput::PilotIs12V
+        ));
     }
 
     /// Bug 2: `get_pilot_state` has 1 V dead bands between every level.

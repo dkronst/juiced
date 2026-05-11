@@ -68,9 +68,16 @@ fn StatusView(status: ReadSignal<Option<Status>>) -> impl IntoView {
                 <div class="card">
                     <div class="grid">
                         <div class="metric">
-                            <div class="label">"Pilot voltage"</div>
+                            <div class="label">"Pilot peak (+)"</div>
                             <div class="value">
-                                {format_volt_range(s.pilot_v_min, s.pilot_v_max)}
+                                {format_signed(s.pilot_v_max)}
+                                <span class="unit">"V"</span>
+                            </div>
+                        </div>
+                        <div class="metric">
+                            <div class="label">"Pilot peak (−)"</div>
+                            <div class="value">
+                                {format_signed(s.pilot_v_min)}
                                 <span class="unit">"V"</span>
                             </div>
                         </div>
@@ -146,10 +153,13 @@ fn format_float(v: Option<f32>) -> String {
     }
 }
 
-fn format_volt_range(min: Option<f32>, max: Option<f32>) -> String {
-    match (min, max) {
-        (Some(lo), Some(hi)) => format!("{:.1} … {:.1}", lo, hi),
-        _ => "—".to_string(),
+/// Show the sign explicitly for pilot peaks (a +9 V vs -12 V reading is
+/// what tells the operator whether the pilot is oscillating).
+fn format_signed(v: Option<f32>) -> String {
+    match v {
+        Some(x) if x >= 0.0 => format!("+{:.1}", x),
+        Some(x) => format!("{:.1}", x), // negative sign already included
+        None => "—".to_string(),
     }
 }
 
