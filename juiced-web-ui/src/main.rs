@@ -138,15 +138,20 @@ fn WaveformCard(status: ReadSignal<Option<Status>>) -> impl IntoView {
                 <span class="label">"Current-sense waveform"</span>
                 <span class="muted" style="font-size:0.8rem">
                     {move || match waveform.get() {
-                        Some(_) => "auto-captured continuously",
-                        None => "waiting for first capture…",
+                        Some(wf) if wf.zero_crossing_found => {
+                            "zero-crossing aligned · auto-captured".to_string()
+                        }
+                        Some(_) => {
+                            "⚠ no negative half found — front end may be half-wave".to_string()
+                        }
+                        None => "waiting for first capture…".to_string(),
                     }}
                 </span>
             </div>
             <div style="margin-top:1rem">
                 {move || match waveform.get() {
                     None => view! {
-                        <p class="muted">"Capture in progress (≈ 4 s)…"</p>
+                        <p class="muted">"Capture in progress (≈ 8 s)…"</p>
                     }.into_any(),
                     Some(wf) => render_waveform(&wf).into_any(),
                 }}
@@ -407,7 +412,8 @@ mod tests {
             ],
             "samples_per_cycle":3,
             "cycle_period_ms":20,
-            "spi_hz":300000
+            "spi_hz":300000,
+            "zero_crossing_found":true
         }"#;
         let wf: Waveform = serde_json::from_str(json).expect("parse waveform");
         assert_eq!(wf.captured_at_unix_ms, 1700000000000);
@@ -415,5 +421,6 @@ mod tests {
         assert_eq!(wf.samples[1].amps, 1.5);
         assert_eq!(wf.samples_per_cycle, 3);
         assert_eq!(wf.cycle_period_ms, 20);
+        assert!(wf.zero_crossing_found);
     }
 }

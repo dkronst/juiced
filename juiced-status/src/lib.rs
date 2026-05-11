@@ -76,6 +76,13 @@ pub struct Waveform {
     /// SPI clock used during sampling; recorded so the operator can sanity
     /// check the effective sample rate from the data.
     pub spi_hz: u32,
+    /// `true` if we located a proper rising zero crossing in the oversampled
+    /// raw buffer (i.e. the previous half-cycle dipped below the noise
+    /// threshold) and trimmed the kept samples to start at it. `false`
+    /// means we never saw a negative half — likely a half-wave-rectified
+    /// front end — and the kept window starts at the (arbitrary) first
+    /// sample. The UI surfaces this so the operator can tell.
+    pub zero_crossing_found: bool,
 }
 
 /// Snapshot of the EVSE status at a point in time. This is the on-the-wire
@@ -385,6 +392,7 @@ mod tests {
             samples_per_cycle: 6,
             cycle_period_ms: 20,
             spi_hz: 300_000,
+            zero_crossing_found: true,
             samples: vec![
                 WaveformSample { t_s: 0.0000, amps: 0.0 },
                 WaveformSample { t_s: 0.0201, amps: 1.5 },

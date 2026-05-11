@@ -213,6 +213,7 @@ mod tests {
             samples_per_cycle: 3,
             cycle_period_ms: 20,
             spi_hz: 300_000,
+            zero_crossing_found: true,
             samples: vec![
                 WaveformSample { t_s: 0.000, amps: 0.0 },
                 WaveformSample { t_s: 0.020, amps: 1.5 },

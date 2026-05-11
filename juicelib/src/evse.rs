@@ -349,12 +349,37 @@ fn cause_from_input(input: &EVSEMachineInput) -> Option<FailedStationCause> {
 /// Instead we use the bandwidth we have *across* many cycles: take one
 /// sample every `(1/50 + 1/(50*N)) s`, where N = `SAMPLES_PER_CYCLE`. The
 /// cumulative drift per sample is `1/(50*N)` = 0.1 ms (at N=200), so over
-/// N samples we walk exactly one full mains cycle of phase. Plot the
-/// samples by `t_s mod (1/50)` and you reconstruct the cycle shape.
+/// N samples we walk exactly one full mains cycle of phase.
 ///
-/// At N=200, capture takes 200 × 20.1 ms ≈ 4.02 s.
+/// We actually sample `OVERSAMPLE * N` (= 2 × N = 400) raw samples, then
+/// find the first rising zero crossing (with a 0.3 A noise hysteresis so a
+/// real swing through zero is required — the previous half-cycle must have
+/// dipped below −0.3 A) and keep N samples from there. This guarantees the
+/// plotted waveform always starts at the same point of the AC cycle, so
+/// consecutive captures overlay rather than slide around.
+///
+/// At N=200, capture takes 400 × 20.1 ms ≈ 8.04 s.
 const SAMPLES_PER_CYCLE: u32 = 200;
+const OVERSAMPLE: u32 = 2;
 const MAINS_PERIOD: Duration = Duration::from_micros(20_000); // 50 Hz
+const ZC_THRESHOLD_AMPS: f32 = 0.3; // empirical noise floor on the CS channel
+
+/// Walk the oversampled buffer and return the index of the first sample
+/// strictly greater than `+ZC_THRESHOLD_AMPS` that follows at least one
+/// sample strictly less than `-ZC_THRESHOLD_AMPS`. Returns `None` if the
+/// signal never dips into the clearly-negative region (typical of a
+/// half-wave-rectified front end).
+fn first_rising_zero_crossing(samples: &[WaveformSample]) -> Option<usize> {
+    let mut saw_negative = false;
+    for (i, s) in samples.iter().enumerate() {
+        if s.amps < -ZC_THRESHOLD_AMPS {
+            saw_negative = true;
+        } else if saw_negative && s.amps > ZC_THRESHOLD_AMPS {
+            return Some(i);
+        }
+    }
+    None
+}
 
 fn run_waveform_capture(
     adc: &crate::adc::Adc,
@@ -363,12 +388,14 @@ fn run_waveform_capture(
     // Per-sample interval = mains period + (mains period / N).
     // At N=200 this is 20 ms + 100 µs = 20 100 µs.
     let inter_sample = MAINS_PERIOD + MAINS_PERIOD / SAMPLES_PER_CYCLE;
+    let n = SAMPLES_PER_CYCLE as usize;
+    let raw_n = (SAMPLES_PER_CYCLE * OVERSAMPLE) as usize;
 
     let start = Instant::now();
-    let mut samples: Vec<WaveformSample> = Vec::with_capacity(SAMPLES_PER_CYCLE as usize);
+    let mut raw: Vec<WaveformSample> = Vec::with_capacity(raw_n);
 
-    for i in 0..SAMPLES_PER_CYCLE {
-        let target = start + inter_sample * i;
+    for i in 0..raw_n {
+        let target = start + inter_sample * (i as u32);
         // Park until the deadline. `thread::sleep` resolution is ~100 µs on
         // Linux; the short spin covers the final approach for sub-100 µs
         // precision, which is what we need to keep the 0.1 ms drift clean.
@@ -382,8 +409,28 @@ fn run_waveform_capture(
         }
 
         let amps = adc.read_current_sense()?;
-        let t_s = (Instant::now() - start).as_secs_f32();
-        samples.push(WaveformSample { t_s, amps });
+        // Use deadline time, not Instant::now() after the read, so each
+        // sample's recorded `t_s` is on the strict 20.1 ms grid — the SPI
+        // read itself adds ~83 µs of jitter which we don't want in the
+        // phase axis.
+        let t_s = (target - start).as_secs_f32();
+        raw.push(WaveformSample { t_s, amps });
+    }
+
+    // Find the rising zero crossing and trim. If we can't find one, fall
+    // back to the leading window so we still produce *some* plot — the UI
+    // shows zero_crossing_found=false so the operator knows what they're
+    // looking at.
+    let (mut kept, zero_crossing_found) = match first_rising_zero_crossing(&raw) {
+        Some(zc) if zc + n <= raw.len() => (raw[zc..zc + n].to_vec(), true),
+        _ => (raw[..n].to_vec(), false),
+    };
+
+    // Re-zero `t_s` so the kept slice's first sample is at phase 0. Each
+    // subsequent sample is at 0.1 ms more of phase (synchronous-
+    // undersampling property), so `t_s mod 20 ms` recovers a clean wave.
+    for (i, s) in kept.iter_mut().enumerate() {
+        s.t_s = inter_sample.as_secs_f32() * (i as f32);
     }
 
     let captured_at_unix_ms = std::time::SystemTime::now()
@@ -391,18 +438,19 @@ fn run_waveform_capture(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // Compute RMS from the same samples (they uniformly cover one cycle of
-    // phase, which is exactly what makes this estimator unbiased).
-    let sum_sq: f64 = samples.iter().map(|s| (s.amps as f64) * (s.amps as f64)).sum();
-    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
+    // RMS from the kept samples (they uniformly cover one cycle of phase,
+    // which makes mean-of-squares an unbiased RMS estimator).
+    let sum_sq: f64 = kept.iter().map(|s| (s.amps as f64) * (s.amps as f64)).sum();
+    let rms = (sum_sq / kept.len() as f64).sqrt() as f32;
     broker.update_current_amps(rms);
 
     broker.publish_waveform(Waveform {
         captured_at_unix_ms,
-        samples,
+        samples: kept,
         samples_per_cycle: SAMPLES_PER_CYCLE,
         cycle_period_ms: MAINS_PERIOD.as_millis() as u32,
         spi_hz: crate::adc::Adc::SPI_HZ,
+        zero_crossing_found,
     });
     Ok(())
 }
@@ -1391,6 +1439,65 @@ mod tests {
     }
 
     // ----- Supervisor classification (in-process restart) -----
+
+    fn ws(t_s: f32, amps: f32) -> WaveformSample {
+        WaveformSample { t_s, amps }
+    }
+
+    #[test]
+    fn test_first_rising_zero_crossing_basic_bipolar_signal() {
+        // Synthetic: a few negative samples, then climb through 0 into
+        // positive territory. ZC should land on the first sample > +0.3 A
+        // after the negative excursion.
+        let samples = vec![
+            ws(0.0, -5.0),   // negative half
+            ws(0.1, -3.0),
+            ws(0.2, -0.1),   // approaching zero, but still inside noise band
+            ws(0.3, 0.2),    // crossed zero but inside ±0.3 A band (ignored)
+            ws(0.4, 0.5),    // ← first sample clearly > +0.3 A after neg
+            ws(0.5, 1.0),
+        ];
+        assert_eq!(first_rising_zero_crossing(&samples), Some(4));
+    }
+
+    #[test]
+    fn test_first_rising_zero_crossing_requires_prior_negative() {
+        // No sample < -0.3 A → no "rising" zero crossing.
+        let samples = vec![
+            ws(0.0, 0.0),
+            ws(0.1, 0.1),
+            ws(0.2, 0.5),  // clearly positive, but no prior negative
+            ws(0.3, 1.0),
+        ];
+        assert_eq!(first_rising_zero_crossing(&samples), None);
+    }
+
+    #[test]
+    fn test_first_rising_zero_crossing_ignores_sub_threshold_noise() {
+        // Tiny negative noise (−0.1 A) should NOT arm the detector;
+        // a brief blip above +0.3 A then should not be a crossing.
+        let samples = vec![
+            ws(0.0, -0.1),
+            ws(0.1, 0.0),
+            ws(0.2, 0.5),
+            ws(0.3, 0.1),
+            // First *real* negative excursion:
+            ws(0.4, -1.5),
+            ws(0.5, -0.4),
+            ws(0.6, 0.4),    // ← this is the real ZC (clearly > +0.3 after < -0.3)
+        ];
+        assert_eq!(first_rising_zero_crossing(&samples), Some(6));
+    }
+
+    #[test]
+    fn test_first_rising_zero_crossing_returns_first_of_many() {
+        let mut samples = vec![ws(0.0, -1.0), ws(0.1, 1.0)]; // ZC at index 1
+        // Add a later second cycle.
+        samples.push(ws(0.2, 1.0));
+        samples.push(ws(0.3, -1.0));
+        samples.push(ws(0.4, 1.0));
+        assert_eq!(first_rising_zero_crossing(&samples), Some(1));
+    }
 
     #[test]
     fn test_classify_hardware_fault_is_restartable() {

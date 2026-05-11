@@ -146,5 +146,6 @@ fn fabricate_waveform() -> Waveform {
         samples_per_cycle: n,
         cycle_period_ms: (mains_period_s * 1000.0) as u32,
         spi_hz: 300_000,
+        zero_crossing_found: true,
     }
 }
