@@ -3,7 +3,7 @@
 
 // Define the state machine of an AC EVSE:
 
-use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, RwLock}};
+use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock}};
 
 use rppal::gpio::{Level, Trigger};
 use rust_fsm::*;
@@ -157,22 +157,38 @@ pub enum Fault {
 
 fn get_pilot_state(min_max: (f32, f32)) -> EVSEMachineInput {
     let (vm12, voltage) = min_max;
-    if (vm12 > -11.0 && vm12 > -13.0) && vm12 < 0.0 {    // If the pilot is oscilating?
+    // Missing-diode / oscillating-pilot integrity check: when the pilot is
+    // oscillating (i.e. we are offering charging), the minimum must reach
+    // near -12 V. A negative-but-shallow minimum (e.g. -5 V) means the
+    // protection diode is gone. Only enforce when the max is positive so we
+    // do not flag a steady -12 V fault-state pilot.
+    if voltage > 0.0 && vm12 > -11.0 {
         info!("Pilot minimum voltage is out of range: {}", vm12);
         return EVSEMachineInput::PilotInError;
     }
-    if  13.0 > voltage && voltage > 11.0 {
+    // Classify by max voltage. Bands meet at the midpoint of each adjacent
+    // J1772 level so a brief sample during a vehicle transition cannot land
+    // in a gap and produce a spurious PilotInError.
+    if voltage > 13.5 {
+        info!("Pilot voltage above spec: {}", voltage);
+        EVSEMachineInput::PilotInError
+    } else if voltage > 10.5 {
         EVSEMachineInput::PilotIs12V
-    } else if 10.0 > voltage && voltage > 8.0 {
+    } else if voltage > 7.5 {
         EVSEMachineInput::PilotIs9V
-    } else if 7.0 > voltage && voltage > 5.0 {
+    } else if voltage > 4.5 {
         EVSEMachineInput::PilotIs6V
-    } else if 4.0 > voltage && voltage > 2.0 {
+    } else if voltage > 1.5 {
         EVSEMachineInput::PilotIs3V
-    } else if -11.0 > voltage && voltage > -13.0 {
+    } else if voltage > -10.5 {
+        // Voltages near zero or shallow negatives — the pilot is in a bad
+        // place that does not correspond to any J1772 level.
+        info!("Pilot voltage is out of range: {}", voltage);
+        EVSEMachineInput::PilotInError
+    } else if voltage >= -13.5 {
         EVSEMachineInput::PilotIsNegative12V
     } else {
-        info!("Pilot voltage is out of range: {}", voltage);
+        info!("Pilot voltage below spec: {}", voltage);
         EVSEMachineInput::PilotInError
     }
 }
@@ -191,7 +207,14 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
                     debug!("Pilot voltage: {:?}", voltage);
                     get_pilot_state(voltage)
                 },
-                Err(_) => EVSEMachineInput::PilotInError,
+                Err(_) => {
+                    // The ADC thread closed the channel — the sensing subsystem
+                    // is dead. Route this to HardwareFault so we land in
+                    // FailedStation rather than drifting through StopCharging
+                    // with a `PilotInError` that looks vehicle-driven.
+                    error!("Pilot channel closed; ADC thread is gone");
+                    EVSEMachineInput::HardwareFault
+                },
             }
         },
         1 => {
@@ -303,32 +326,47 @@ fn start_fault_thread(
     fault_tx: crossbeam_channel::Sender<Fault>,
 ) -> Result<(), HwError> {
     let pins = periph.get_pins();
-    
-    thread::spawn(move || {
-        let res = || -> Result<(), HwError> {
-            let cond = Arc::new(Condvar::new());
-            loop {
-                let fault_tx = fault_tx.clone();
-                let cond = Arc::clone(&cond);
-                {
-                    let mut locked_pins = pins.lock().
-                        map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
 
-                    let cond_clone = Arc::clone(&cond);
-                    locked_pins.gfi_status_pin.set_async_interrupt(Trigger::RisingEdge, move |_| {
-                        cond_clone.notify_all();
-                    }).change_context(HwError::GpioError)?;
-                    let locked_pins = cond.wait(locked_pins).map_err(
-                        |e| Report::new(HwError::PoisonError).attach_printable(format!("failed waiting on condvar: {:?}", e))
-                    )?;
-                    let gfi_status = locked_pins.gfi_status_pin.is_high();
-                    let contactor = locked_pins.contactor_pin.is_set_high();
-                    if gfi_status && contactor {
-                        fault_tx.send(Fault::GFIInterrupted)
-                            .map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed sending fault: {:?}", e)))?;
-                    } else if !contactor {
-                        debug!("GFI Interrupted, but contactor is off. Ignoring.");
-                    }
+    thread::spawn(move || {
+        // The interrupt closure pushes a unit token onto this channel; the
+        // loop blocks on `recv`. Channels queue, so notifications fired
+        // before the loop reaches `recv` are *not* lost the way a condvar's
+        // would have been.
+        let (event_tx, event_rx) = bounded::<()>(16);
+        let res = || -> Result<(), HwError> {
+            // Install the interrupt exactly once. Repeatedly re-installing
+            // it (as the previous design did) is wasteful and leaks
+            // closures inside rppal.
+            {
+                let mut locked_pins = pins.lock()
+                    .map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
+                let event_tx_cb = event_tx.clone();
+                locked_pins.gfi_status_pin.set_async_interrupt(Trigger::RisingEdge, move |_| {
+                    let _ = event_tx_cb.try_send(());
+                }).change_context(HwError::GpioError)?;
+                // If the GFI is already latched high before we installed the
+                // handler, no rising edge will fire — synthesize one event so
+                // we evaluate the fault on the next iteration.
+                if locked_pins.gfi_status_pin.is_high() {
+                    let _ = event_tx.try_send(());
+                }
+            }
+
+            loop {
+                event_rx.recv().map_err(|e| {
+                    Report::new(HwError::PoisonError)
+                        .attach_printable(format!("gfi event channel closed: {:?}", e))
+                })?;
+                let (gfi_status, contactor) = {
+                    let locked_pins = pins.lock()
+                        .map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed locking pins: {:?}", e)))?;
+                    (locked_pins.gfi_status_pin.is_high(), locked_pins.contactor_pin.is_set_high())
+                };
+                if gfi_status && contactor {
+                    fault_tx.send(Fault::GFIInterrupted)
+                        .map_err(|e| Report::new(HwError::PoisonError).attach_printable(format!("failed sending fault: {:?}", e)))?;
+                } else if !contactor {
+                    debug!("GFI Interrupted, but contactor is off. Ignoring.");
                 }
             }
         }();
@@ -382,7 +420,6 @@ pub trait EVSEHardware {
 
 pub struct EVSEHardwareImpl {
     contactor: OnOff,
-    current_offer: f32,
     ground_test_pin: OnOff,
     hw_peripherals: GpioPeripherals,
 }
@@ -409,7 +446,6 @@ impl EVSEHardwareImpl {
     pub fn new() -> Result<Self, HwError> {
         let mut ret = Self {
             contactor: OnOff::Off,
-            current_offer: 0.0,
             ground_test_pin: OnOff::Off,
             hw_peripherals: GpioPeripherals::new().change_context(HwError::HardwareFault)?,
         };
@@ -444,7 +480,6 @@ impl EVSEHardware for EVSEHardwareImpl {
 
     fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
         self.hw_peripherals.set_pilot_ampere(ampere).change_context(HwError::HardwareFault)?;
-        self.current_offer = ampere;
         Ok(())
     }
 
@@ -489,26 +524,28 @@ where T: EVSEHardware
             ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Incorrect relay test pin state"));
             hw.set_contactor(OnOff::Off)?;
             thread::sleep(Duration::from_millis(200));
-            next_state_input = Some(EVSEMachineInput::SelfTestOk);
             let state = hw.get_contactor_state()?;
             debug!("Machine is set to 'Charging'. Contactor state: {:?}", state);
             if OnOff::Off == state {
                 info!("Contactor is off. Running GFI self test.");
                 let self_test_result = run_gfi_self_test(hw)?;
                 match self_test_result {
-                    EVSEMachineInput::SelfTestFailed => {
-                        return Err(Report::new(HwError::HardwareFault).attach_printable("GFI self test failed before power on"));
-                    },
-                    _ => {
+                    EVSEMachineInput::SelfTestOk => {
                         info!("Self test passed. Turning on contactor.");
                         hw.set_contactor(OnOff::On)?;
                         thread::sleep(Duration::from_millis(200));
+                    },
+                    other => {
+                        return Err(Report::new(HwError::HardwareFault)
+                            .attach_printable(format!("GFI self test did not return SelfTestOk: {:?}", other)));
                     }
                 }
             }
             // At this point, the contactor is On and the mains should be connected.
             // Make sure that the 220V is high
             ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
+            // Only now is it safe to advance the FSM into `Charging`.
+            next_state_input = Some(EVSEMachineInput::SelfTestOk);
         },
         EVSEMachineState::Charging => {
             // Basically, there's nothing to do, for now. Later, we'll need to update the UI etc.
@@ -516,12 +553,15 @@ where T: EVSEHardware
             ensure!(hw.get_relay_test_pin() == Level::High, report!(HwError::HardwareFault).attach_printable("Relay should be on when charging"));
         },
         EVSEMachineState::StopCharging => {
-            // At this point the vehicle has signaled that it's done charging. No current should be flowing.
-            // We need to turn off the contactor and wait for the vehicle to either reset, or unlatch.
+            // Per spec §138 the contactor must NOT open while the vehicle is
+            // still drawing current. Drop the pilot offer to 0 first so the
+            // vehicle observes the signal and winds its draw down to near
+            // zero, and only then break the contactor.
             listen_to_pilot.store(false, Ordering::Relaxed);
             hw.set_current_offer_ampere(0.)?;
+            thread::sleep(Duration::from_secs(2)); // wind-down for vehicle current
             hw.set_contactor(OnOff::Off)?;
-            thread::sleep(Duration::from_secs(5)); // If the vehicle is still connected, a period of time is needed for resetting the charging cycle (in the vehicle)
+            thread::sleep(Duration::from_secs(3)); // inter-cycle reset on vehicle side
             ensure!(hw.get_relay_test_pin() == Level::Low, report!(HwError::HardwareFault).attach_printable("Relay should be off when charging is stopped"));
             next_state_input = Some(EVSEMachineInput::ChargingFinished);
         },
@@ -538,8 +578,11 @@ where T: EVSEHardware
         }
         _ => {
             hw.set_contactor(OnOff::Off)?;
-            ensure!(hw.get_relay_test_pin() == Level::High, HwError::HardwareFault);
-            // Do nothing otherwise
+            thread::sleep(Duration::from_millis(100)); // 100 ms grace per spec line 55
+            ensure!(
+                hw.get_relay_test_pin() == Level::Low,
+                report!(HwError::HardwareFault).attach_printable("Relay must drop Low within 100 ms of contactor off")
+            );
         }
     }
     debug!("State transition done. Next state input: {:?}, current state: {:?}", next_state_input, state);
@@ -550,25 +593,25 @@ pub fn start_machine<T>(mut evse: T) -> Result<(), HwError>
 where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
-    let liste_to_pilot = Arc::new(AtomicBool::new(false));
+    let listen_to_pilot = Arc::new(AtomicBool::new(false));
     let sensor_state = Arc::new(RwLock::new(SensorsState::new()));
 
     let (fault_tx, fault_chan) = bounded::<Fault>(16);
     let pilot_voltage_chan = start_adc_thread(
         evse.get_peripherals(),
-        Arc::clone(&liste_to_pilot),
+        Arc::clone(&listen_to_pilot),
         Arc::clone(&sensor_state),
         fault_tx.clone(),
     )?;
     start_fault_thread(evse.get_peripherals(), fault_tx)?;
 
     loop {
-        let mut state_input = EVSEMachineInput::PilotInError;
+        let state_input: EVSEMachineInput;
         match machine.state() {
             EVSEMachineState::SelfTest => {
                 // Do the self test
                 let self_test_result = run_gfi_self_test(&mut evse);
-                liste_to_pilot.store(false, Ordering::Relaxed);
+                listen_to_pilot.store(false, Ordering::Relaxed);
                 match self_test_result {
                     Err(e) => {
                         state_input = EVSEMachineInput::SelfTestFailed;
@@ -585,7 +628,14 @@ where T: EVSEHardware + Send + Sync
                 }
             },
             EVSEMachineState::ResetableError => {
-                // todo!("Reset the error");
+                // Hold safely until the user drives the pilot to +12 V (i.e.
+                // unplugs the vehicle), which transitions us back to Standby.
+                // Without blocking on real input here we would busy-loop the
+                // outer state-machine match at 100% CPU.
+                state_input = get_new_state_input(
+                    pilot_voltage_chan.clone(),
+                    fault_chan.clone(),
+                );
             },
             EVSEMachineState::FailedStation => {
                 error!("Station failed. Full reset required, contact admin if the issue persists.");
@@ -597,7 +647,7 @@ where T: EVSEHardware + Send + Sync
                 if let Err(e) = evse.get_peripherals().set_pilot_ampere(0.0) {
                     error!("FailedStation: failed to drive pilot to error: {:?}", e);
                 }
-                liste_to_pilot.store(false, Ordering::Relaxed);
+                listen_to_pilot.store(false, Ordering::Relaxed);
                 loop {
                     thread::sleep(Duration::from_secs(60));
                 }
@@ -619,7 +669,7 @@ where T: EVSEHardware + Send + Sync
                 // We will decide on a pilot error, or we'll get one from the channel if 
                 // a timeout occurs, or an actual error (wrong voltage, for example) occurs.
                 
-                let res = do_state_transition(state, &mut evse, &liste_to_pilot);
+                let res = do_state_transition(state, &mut evse, &listen_to_pilot);
                 match res {
                     Err(e) => {
                         error!("Error: {:?}", e);
@@ -777,5 +827,227 @@ mod tests {
         info!("Output: {:?}", output.unwrap());
         info!("State: {:?}", machine.state());
         assert!(matches!(machine.state(), EVSEMachineState::NoPower));
+    }
+
+    // ----- Bug-driven tests (CTF review) -----
+    //
+    // The tests below were written to fail on the buggy code described in
+    // the audit; once the corresponding fixes land, they should pass.
+
+    use std::time::Instant;
+
+    struct MockHardware {
+        contactor: OnOff,
+        relay_test_pin: Level,
+        gfi_status_pin: Level,
+        gfi_test_pin: OnOff,
+        current_offer: f32,
+        pilot_waiting: bool,
+        events: Vec<(Instant, String)>,
+    }
+
+    impl MockHardware {
+        fn new() -> Self {
+            Self {
+                contactor: OnOff::Off,
+                relay_test_pin: Level::Low,
+                gfi_status_pin: Level::Low,
+                gfi_test_pin: OnOff::Off,
+                current_offer: 0.0,
+                pilot_waiting: false,
+                events: Vec::new(),
+            }
+        }
+
+        fn record(&mut self, event: String) {
+            self.events.push((Instant::now(), event));
+        }
+
+        fn time_of(&self, event: &str) -> Option<Instant> {
+            self.events.iter().find(|(_, e)| e == event).map(|(t, _)| *t)
+        }
+    }
+
+    impl EVSEHardware for MockHardware {
+        fn set_contactor(&mut self, state: OnOff) -> Result<(), HwError> {
+            self.record(format!("set_contactor({:?})", state));
+            self.contactor = state.clone();
+            self.relay_test_pin = match state {
+                OnOff::On => Level::High,
+                OnOff::Off => Level::Low,
+            };
+            Ok(())
+        }
+
+        fn set_current_offer_ampere(&mut self, ampere: f32) -> Result<(), HwError> {
+            self.record(format!("set_current_offer({})", ampere));
+            self.current_offer = ampere;
+            Ok(())
+        }
+
+        fn set_ground_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
+            self.record(format!("set_ground_test_pin({:?})", state));
+            self.gfi_test_pin = state;
+            Ok(())
+        }
+
+        fn get_contactor_state(&mut self) -> Result<OnOff, HwError> {
+            Ok(self.relay_test_pin.into())
+        }
+
+        fn get_peripherals(&mut self) -> &mut GpioPeripherals {
+            unimplemented!("MockHardware does not back GpioPeripherals; \
+                            do_state_transition must not call get_peripherals \
+                            for any state under test")
+        }
+
+        // Override every default impl that goes through get_peripherals so the
+        // mock does not panic.
+        fn get_relay_test_pin(&mut self) -> Level {
+            self.relay_test_pin
+        }
+
+        fn get_gfi_status_pin(&mut self) -> Level {
+            self.gfi_status_pin
+        }
+
+        fn gfi_reset(&mut self) -> Result<(), HwError> {
+            self.record("gfi_reset".to_string());
+            self.gfi_status_pin = Level::Low;
+            Ok(())
+        }
+
+        fn reset_gfi_status_pin(&mut self) -> Result<(), HwError> {
+            self.record("reset_gfi_status_pin".to_string());
+            self.gfi_status_pin = Level::Low;
+            Ok(())
+        }
+
+        fn set_waiting_for_vehicle(&mut self) -> Result<(), HwError> {
+            self.record("set_waiting_for_vehicle".to_string());
+            self.pilot_waiting = true;
+            self.contactor = OnOff::Off;
+            self.gfi_test_pin = OnOff::Off;
+            Ok(())
+        }
+    }
+
+    /// Bug 1: the catch-all `_` arm of `do_state_transition` turns the
+    /// contactor off and then ensures the relay-test pin is High — backwards.
+    /// Hitting `VentilationNeeded` (vehicle status D, 3 V) should not blow up.
+    #[test]
+    fn test_ventilation_needed_does_not_self_destruct() {
+        let mut mock = MockHardware::new();
+        // Pretend we arrived from Charging with the contactor on.
+        mock.contactor = OnOff::On;
+        mock.relay_test_pin = Level::High;
+
+        let listen = Arc::new(AtomicBool::new(true));
+        let result = do_state_transition(
+            &EVSEMachineState::VentilationNeeded,
+            &mut mock,
+            &listen,
+        );
+
+        assert!(
+            result.is_ok(),
+            "VentilationNeeded should not return HwError. result = {:?}\nevents = {:?}",
+            result, mock.events,
+        );
+    }
+
+    /// Bug 2: `get_pilot_state` has 1 V dead bands between every level.
+    /// A 50 ms sample landing in a gap during a legitimate transition
+    /// returns `PilotInError`, which can force a mid-charge `StopCharging`.
+    #[test]
+    fn test_pilot_state_gap_voltages_not_pilot_error() {
+        // Between PilotIs6V (5..7) and PilotIs9V (8..10).
+        let input = get_pilot_state((-12.0, 7.5));
+        assert!(
+            !matches!(input, EVSEMachineInput::PilotInError),
+            "7.5 V should be classified, not PilotInError. Got {:?}",
+            input
+        );
+
+        // Between PilotIs3V (2..4) and PilotIs6V (5..7).
+        let input = get_pilot_state((-12.0, 4.5));
+        assert!(
+            !matches!(input, EVSEMachineInput::PilotInError),
+            "4.5 V should be classified, not PilotInError. Got {:?}",
+            input
+        );
+
+        // Between PilotIs9V (8..10) and PilotIs12V (11..13).
+        let input = get_pilot_state((-12.0, 10.5));
+        assert!(
+            !matches!(input, EVSEMachineInput::PilotInError),
+            "10.5 V should be classified, not PilotInError. Got {:?}",
+            input
+        );
+
+        // Boundary inside an existing band — sanity that we did not over-correct.
+        assert!(matches!(get_pilot_state((-12.0, 12.0)), EVSEMachineInput::PilotIs12V));
+        assert!(matches!(get_pilot_state((-12.0,  9.0)), EVSEMachineInput::PilotIs9V));
+        assert!(matches!(get_pilot_state((-12.0,  6.0)), EVSEMachineInput::PilotIs6V));
+        assert!(matches!(get_pilot_state((-12.0,  3.0)), EVSEMachineInput::PilotIs3V));
+        assert!(matches!(get_pilot_state((-12.0, -12.0)), EVSEMachineInput::PilotIsNegative12V));
+    }
+
+    /// Bug 7: `StopCharging` opens the contactor immediately after dropping the
+    /// pilot offer to 0 — under load. Per spec §138 the vehicle must be given
+    /// time to wind down before the contactor breaks the circuit.
+    #[test]
+    fn test_stop_charging_waits_before_opening_contactor() {
+        let mut mock = MockHardware::new();
+        // Entering StopCharging from Charging: contactor on, relay test high.
+        mock.contactor = OnOff::On;
+        mock.relay_test_pin = Level::High;
+
+        let listen = Arc::new(AtomicBool::new(true));
+        let result = do_state_transition(
+            &EVSEMachineState::StopCharging,
+            &mut mock,
+            &listen,
+        );
+
+        assert!(result.is_ok(), "StopCharging returned error: {:?}", result);
+
+        let offer_zero = mock
+            .time_of("set_current_offer(0)")
+            .expect("set_current_offer(0) was never called");
+        let contactor_off = mock
+            .time_of("set_contactor(Off)")
+            .expect("set_contactor(Off) was never called");
+
+        assert!(
+            offer_zero < contactor_off,
+            "Pilot offer must drop to 0 strictly before opening the contactor"
+        );
+
+        let wind_down = contactor_off.duration_since(offer_zero);
+        assert!(
+            wind_down >= Duration::from_secs(2),
+            "Need >= 2 s between offer=0 and contactor=Off for vehicle wind-down; got {:?}",
+            wind_down
+        );
+    }
+
+    /// Bug 8: the ADC thread closes `pilot_voltage_chan` on its way out (e.g.
+    /// SPI failure). `get_new_state_input` currently maps the closed-channel
+    /// `Err` to `PilotInError`, which from `Charging` drives us through
+    /// `StopCharging` rather than to `FailedStation`. A dead sensing subsystem
+    /// is a hardware fault.
+    #[test]
+    fn test_closed_pilot_channel_signals_hardware_fault() {
+        let (pilot_tx, pilot_rx) = bounded::<(f32, f32)>(1);
+        let (_fault_tx, fault_rx) = bounded::<Fault>(1);
+        drop(pilot_tx); // close the pilot channel
+
+        let input = get_new_state_input(pilot_rx, fault_rx);
+        assert!(
+            matches!(input, EVSEMachineInput::HardwareFault),
+            "Closed pilot channel should yield HardwareFault, not {:?}",
+            input
+        );
     }
 }
