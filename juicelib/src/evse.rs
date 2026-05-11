@@ -14,6 +14,8 @@ use log::{info, error, debug};
 
 use crossbeam_channel::{Receiver, Select, bounded};
 
+use juiced_status::{FsmState, StatusBroker, SupervisorPhase};
+
 use crate::peripherals::GpioPeripherals;
 use crate::sensors::SensorsState;
 
@@ -102,8 +104,25 @@ state_machine! {
     },
 }
 
-// The state machine is the continuation of the main thread - i.e. it 
-// takes the foreground and is the main loop of the program. 
+impl From<&EVSEMachineState> for FsmState {
+    fn from(s: &EVSEMachineState) -> Self {
+        match s {
+            EVSEMachineState::SelfTest => FsmState::SelfTest,
+            EVSEMachineState::Standby => FsmState::Standby,
+            EVSEMachineState::VehicleDetected => FsmState::VehicleDetected,
+            EVSEMachineState::StartCharging => FsmState::StartCharging,
+            EVSEMachineState::Charging => FsmState::Charging,
+            EVSEMachineState::StopCharging => FsmState::StopCharging,
+            EVSEMachineState::NoPower => FsmState::NoPower,
+            EVSEMachineState::VentilationNeeded => FsmState::VentilationNeeded,
+            EVSEMachineState::ResetableError => FsmState::ResetableError,
+            EVSEMachineState::FailedStation => FsmState::FailedStation,
+        }
+    }
+}
+
+// The state machine is the continuation of the main thread - i.e. it
+// takes the foreground and is the main loop of the program.
 // The point here is to prevent safety issues by having a state machine
 // fail and crash when inside a different thread - thus not disconnecting.
 
@@ -324,6 +343,7 @@ fn start_adc_thread(
     sensors_state: Arc<RwLock<SensorsState>>,
     fault_tx: crossbeam_channel::Sender<Fault>,
     running: Arc<AtomicBool>,
+    broker: Arc<StatusBroker>,
 ) -> Result<(Receiver<(f32, f32)>, thread::JoinHandle<()>), HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
@@ -352,6 +372,9 @@ fn start_adc_thread(
                         (min, max) = p2p;
                         current = cs;
                         voltage = mv;
+                        broker.update_pilot_voltage(min, max);
+                        broker.update_current_amps(current);
+                        broker.update_mains_voltage(voltage);
                     },
                     (p2p, cs, mv) => {
                         error!("ADC read failed: p2p={:?} cs={:?} mv={:?}", p2p.err(), cs.err(), mv.err());
@@ -675,13 +698,17 @@ fn enter_safe_state<T: EVSEHardware>(evse: &mut T, listen_to_pilot: &Arc<AtomicB
     listen_to_pilot.store(false, Ordering::Relaxed);
 }
 
-pub fn start_machine<T>(mut evse: T) -> Result<TerminationReason, HwError>
+pub fn start_machine<T>(mut evse: T, broker: Arc<StatusBroker>) -> Result<TerminationReason, HwError>
 where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
     let listen_to_pilot = Arc::new(AtomicBool::new(false));
     let sensor_state = Arc::new(RwLock::new(SensorsState::new()));
     let running = Arc::new(AtomicBool::new(true));
+
+    // Publish the initial FSM state immediately so subscribers see a value
+    // before the first iteration of the loop.
+    broker.set_fsm_state(FsmState::from(machine.state()));
 
     let (fault_tx, fault_chan) = bounded::<Fault>(16);
     let (pilot_voltage_chan, adc_handle) = start_adc_thread(
@@ -690,6 +717,7 @@ where T: EVSEHardware + Send + Sync
         Arc::clone(&sensor_state),
         fault_tx.clone(),
         Arc::clone(&running),
+        Arc::clone(&broker),
     )?;
     let fault_handle = start_fault_thread(
         evse.get_peripherals(),
@@ -795,6 +823,10 @@ where T: EVSEHardware + Send + Sync
         let output = machine.consume(&state_input);
         debug!("Output: {:?}", output);
         debug!("State: {:?}", machine.state());
+        broker.set_fsm_state(FsmState::from(machine.state()));
+        if let Ok(contactor) = evse.get_contactor_state() {
+            broker.set_contactor_on(matches!(contactor, OnOff::On));
+        }
     };
 
     // Signal shutdown and join threads so the hardware Arcs they hold drop
@@ -825,33 +857,70 @@ const SUPERVISOR_RETRY_DELAY: Duration = Duration::from_secs(20);
 /// - `Safety` faults (true ground fault, no PE wire, GFI self-test failing
 ///   at startup) → enter terminal safe-idle loop. These need human attention;
 ///   spinning on them in software would be unsafe.
-pub fn run_until_fatal() -> ! {
+pub fn run_until_fatal(broker: Arc<StatusBroker>) -> ! {
     loop {
+        broker.set_supervisor(SupervisorPhase::Initializing);
         let evse = match EVSEHardwareImpl::new() {
             Ok(e) => e,
             Err(e) => {
                 error!("EVSE init failed: {:?}. Retrying in {:?}.", e, SUPERVISOR_RETRY_DELAY);
+                publish_restarting(&broker, format!("init failed: {:?}", e));
                 thread::sleep(SUPERVISOR_RETRY_DELAY);
                 continue;
             }
         };
-        match start_machine(evse) {
+        broker.set_supervisor(SupervisorPhase::Running);
+        match start_machine(evse, Arc::clone(&broker)) {
             Err(e) => {
                 error!("Thread setup failed: {:?}. Retrying in {:?}.", e, SUPERVISOR_RETRY_DELAY);
+                publish_restarting(&broker, format!("thread setup failed: {:?}", e));
                 thread::sleep(SUPERVISOR_RETRY_DELAY);
             }
             Ok(TerminationReason::Restartable(e)) => {
                 error!("Restartable EVSE fault: {:?}. Restarting in {:?}.", e, SUPERVISOR_RETRY_DELAY);
+                publish_restarting(&broker, format!("restartable fault: {:?}", e));
                 thread::sleep(SUPERVISOR_RETRY_DELAY);
             }
             Ok(TerminationReason::Safety(fault)) => {
                 error!("Non-restartable safety fault: {:?}. Holding safe-idle until human reset.", fault);
+                broker.set_supervisor(SupervisorPhase::TerminalFault {
+                    fault: format!("{:?}", fault),
+                });
                 loop {
                     thread::sleep(Duration::from_secs(60));
                 }
             }
         }
     }
+}
+
+fn publish_restarting(broker: &StatusBroker, reason: String) {
+    broker.set_supervisor(SupervisorPhase::RestartingIn {
+        seconds_remaining: SUPERVISOR_RETRY_DELAY.as_secs(),
+        reason: strip_ansi(&reason),
+    });
+}
+
+/// `error_stack::Report`'s Debug format includes ANSI color codes by default.
+/// Strip them so the dashboard renders cleanly.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // Skip until the final byte (a letter)
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1255,6 +1324,47 @@ mod tests {
             "Unknown cause should default to Restartable; got {:?}",
             reason
         );
+    }
+
+    #[test]
+    fn test_fsm_state_from_evse_machine_state_is_exhaustive() {
+        // Every variant of EVSEMachineState maps to a distinct FsmState.
+        // The `match` inside `From` is exhaustive at compile time; this test
+        // verifies the mappings are correct and protects against a silent
+        // re-pointing if either enum is reordered.
+        let cases: &[(EVSEMachineState, FsmState)] = &[
+            (EVSEMachineState::SelfTest, FsmState::SelfTest),
+            (EVSEMachineState::Standby, FsmState::Standby),
+            (EVSEMachineState::VehicleDetected, FsmState::VehicleDetected),
+            (EVSEMachineState::StartCharging, FsmState::StartCharging),
+            (EVSEMachineState::Charging, FsmState::Charging),
+            (EVSEMachineState::StopCharging, FsmState::StopCharging),
+            (EVSEMachineState::NoPower, FsmState::NoPower),
+            (EVSEMachineState::VentilationNeeded, FsmState::VentilationNeeded),
+            (EVSEMachineState::ResetableError, FsmState::ResetableError),
+            (EVSEMachineState::FailedStation, FsmState::FailedStation),
+        ];
+        for (evse, expected) in cases {
+            assert_eq!(FsmState::from(evse), *expected, "mapping {:?}", evse);
+        }
+    }
+
+    #[test]
+    fn test_start_machine_publishes_state_to_broker() {
+        // The broker is the public observability surface. We can't run
+        // start_machine() against MockHardware (it spawns threads that
+        // dereference rppal handles), so we exercise the broker write path
+        // directly: simulate a machine step by calling the same broker
+        // methods start_machine would call, and verify a reader observes it.
+        let broker = StatusBroker::new();
+        broker.set_fsm_state(FsmState::from(&EVSEMachineState::Charging));
+        broker.set_contactor_on(true);
+        broker.update_pilot_voltage(-12.0, 6.0);
+
+        let snap = broker.reader().snapshot();
+        assert_eq!(snap.fsm_state, FsmState::Charging);
+        assert_eq!(snap.contactor_on, true);
+        assert_eq!(snap.pilot_v_max, Some(6.0));
     }
 
     #[test]

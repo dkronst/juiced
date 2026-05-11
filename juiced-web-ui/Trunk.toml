@@ -1,0 +1,10 @@
+[build]
+# Predictable filenames so `juiced-web/src/assets.rs` can include_bytes! them.
+filehash = false
+dist = "dist"
+public_url = "/static/"
+
+[[hooks]]
+stage = "build"
+command = "sh"
+command_arguments = ["-c", "echo 'trunk build complete'"]

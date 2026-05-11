@@ -1,5 +1,11 @@
 [workspace]
+resolver = "2"
 members = [
     "juicelib",
     "juiced",
+    "juiced-status",
+    "juiced-web",
+]
+exclude = [
+    "juiced-web-ui",
 ]
