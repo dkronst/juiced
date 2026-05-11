@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rppal::spi::{Bus, Mode, SlaveSelect, Spi, Error as LibError};
 use log::debug;
@@ -66,7 +66,13 @@ impl Adc {
     const SPI_BUS:              Bus = Bus::Spi0;
     const SPI_SLAVE_SELECT: SlaveSelect = SlaveSelect::Ss0;
     const REFERENCE_VOLTAGE:    f32 = 5.0;
-    const NUM_SAMPLES:          u32 = 20;
+    /// Mains period at 50 Hz. RMS integration runs for exactly this long,
+    /// so a phase boundary inside the window can't bias the result. At the
+    /// 300 kHz SPI clock with 24-bit reads we get ≈ 250 samples per window.
+    pub const RMS_WINDOW: Duration = Duration::from_millis(20);
+    /// Reported in `Waveform` so the operator can sanity-check the effective
+    /// sample rate from the recorded data.
+    pub const SPI_HZ: u32 = Self::SPI_FREQUENCY;
 
     pub fn new() -> Result<Self, AdcError> {
         let spi = Spi::new(Self::SPI_BUS, Self::SPI_SLAVE_SELECT, Self::SPI_FREQUENCY, Self::SPI_MODE)?;
@@ -113,19 +119,29 @@ impl Adc {
     }
 
 
+    /// Integrate the squared current-sense reading for exactly one 50 Hz
+    /// mains cycle (`RMS_WINDOW`, 20 ms). At the 300 kHz SPI clock this
+    /// yields ≈ 250 samples evenly distributed across the cycle, so phase
+    /// has only a sub-1 % effect on the result. Replaces the previous
+    /// "20 samples in a tight loop ≈ 1.7 ms" approach which captured less
+    /// than 10 % of a cycle at random phase and caused the choppy display.
     pub fn read_current_sense_rms(&self) -> Result<f32, AdcError> {
-        let mut sum = 0.0;
-        let mut count = 0;
-        let start = std::time::Instant::now();
-        
-        for _ in 0..Self::NUM_SAMPLES {
-            let reading = self.read_current_sense_one_sample()?;
-            sum += reading * reading;
+        let deadline = Instant::now() + Self::RMS_WINDOW;
+        // Accumulate in f64 because we may add ~250 squares of ±~20-ish; f32
+        // precision is fine here, but f64 keeps the math obviously safe.
+        let mut sum_sq: f64 = 0.0;
+        let mut count: u32 = 0;
+        while Instant::now() < deadline {
+            let amps = self.read_current_sense_one_sample()?;
+            sum_sq += (amps as f64) * (amps as f64);
             count += 1;
         }
-        debug!("Current sense: {} samples in {} ms", count, start.elapsed().as_millis());
-        let rms = (sum / count as f32).sqrt();
-        Ok(rms)
+        if count == 0 {
+            // Shouldn't happen — clock didn't advance? — but defend anyway.
+            return Ok(0.0);
+        }
+        debug!("Current sense RMS: {} samples over ~{} ms", count, Self::RMS_WINDOW.as_millis());
+        Ok((sum_sq / count as f64).sqrt() as f32)
     }
 
     #[inline]
@@ -133,6 +149,31 @@ impl Adc {
         let reading = self.mcp.single_ended_read(Self::CURRENT_SENSE_CHANNEL)?;
         let curr = Self::to_amps(reading);
         Ok(curr)
+    }
+
+    /// Sample the current-sense channel as fast as the SPI allows for
+    /// exactly `window` time, returning every raw sample with a monotonic
+    /// `(seconds_since_window_start, amps)` timestamp.
+    ///
+    /// Used by the diagnostic waveform capture path in `start_adc_thread`
+    /// to record what the analog front end actually looks like (full-wave,
+    /// half-wave, biased, clipped, …). Not used by the normal RMS path.
+    pub fn capture_current_waveform_window(
+        &self,
+        window: Duration,
+    ) -> Result<Vec<(f32, f32)>, AdcError> {
+        let start = Instant::now();
+        let deadline = start + window;
+        // Pre-allocate for ~12.5 kHz over `window`; rough cap, will grow if
+        // SPI is faster than expected.
+        let estimated = ((window.as_secs_f64() * 13_000.0) as usize).max(64);
+        let mut samples = Vec::with_capacity(estimated);
+        while Instant::now() < deadline {
+            let t = start.elapsed().as_secs_f32();
+            let amps = self.read_current_sense_one_sample()?;
+            samples.push((t, amps));
+        }
+        Ok(samples)
     }
 
     pub fn peak_to_peak(&self, channel: u8, duration: Duration) -> Result<(f32, f32), AdcError> {

@@ -44,6 +44,34 @@ pub enum SupervisorPhase {
     },
 }
 
+/// One raw current-sense sample inside a diagnostic capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaveformSample {
+    /// Seconds since the start of the *entire* capture (window 0, sample 0 at t=0).
+    pub t_s: f32,
+    pub amps: f32,
+}
+
+/// A diagnostic snapshot of the current-sense waveform.
+///
+/// The capture is composed of `window_count` separate sampling windows
+/// (each `window_ms` ms long, ≈ one 50 Hz mains cycle) at known offsets
+/// from the start. Between windows the ADC thread is idle, so the time
+/// axis has gaps the UI uses to draw cycle boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Waveform {
+    /// Milliseconds since the Unix epoch when the capture *finished*. The
+    /// UI compares this against the broker's previous value to detect a
+    /// fresh capture.
+    pub captured_at_unix_ms: u64,
+    pub samples: Vec<WaveformSample>,
+    pub window_count: u32,
+    pub window_ms: u32,
+    /// SPI clock used during sampling; recorded so the operator can sanity
+    /// check the effective sample rate from the data.
+    pub spi_hz: u32,
+}
+
 /// Snapshot of the EVSE status at a point in time. This is the on-the-wire
 /// shape served by `juiced-web` and consumed by `juiced-web-ui`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +86,10 @@ pub struct Status {
     pub uptime_secs: u64,
     /// Milliseconds since the Unix epoch when any field last changed.
     pub last_update_unix_ms: u64,
+    /// `Some(ts)` if a diagnostic waveform has been captured; ts is the
+    /// `captured_at_unix_ms` of the most recent `Waveform`. The UI polls
+    /// this to detect a fresh capture without GETting the full payload.
+    pub waveform_captured_at_unix_ms: Option<u64>,
 }
 
 impl Status {
@@ -74,6 +106,7 @@ impl Status {
             contactor_on: false,
             uptime_secs: 0,
             last_update_unix_ms: 0,
+            waveform_captured_at_unix_ms: None,
         }
     }
 }
@@ -98,6 +131,7 @@ mod broker_impl {
     /// Shared state container behind the broker and reader. Held by both.
     struct Inner {
         status: RwLock<Status>,
+        waveform: RwLock<Option<Waveform>>,
         start: Instant,
     }
 
@@ -116,6 +150,7 @@ mod broker_impl {
             Self {
                 inner: Arc::new(Inner {
                     status: RwLock::new(Status::initial()),
+                    waveform: RwLock::new(None),
                     start: Instant::now(),
                 }),
             }
@@ -164,6 +199,21 @@ mod broker_impl {
         pub fn set_contactor_on(&self, on: bool) {
             self.write(|s| s.contactor_on = on);
         }
+
+        /// Store a diagnostic waveform and update `Status.waveform_captured_at_unix_ms`
+        /// so UI clients can detect a fresh capture without fetching the full payload.
+        pub fn publish_waveform(&self, waveform: Waveform) {
+            let ts = waveform.captured_at_unix_ms;
+            {
+                let mut slot = self
+                    .inner
+                    .waveform
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
+                *slot = Some(waveform);
+            }
+            self.write(|s| s.waveform_captured_at_unix_ms = Some(ts));
+        }
     }
 
     impl Default for StatusBroker {
@@ -193,11 +243,67 @@ mod broker_impl {
             s.uptime_secs = self.inner.start.elapsed().as_secs();
             s
         }
+
+        /// Latest diagnostic waveform, if any has been captured.
+        pub fn latest_waveform(&self) -> Option<Waveform> {
+            self.inner
+                .waveform
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use broker_impl::{StatusBroker, StatusReader};
+
+// ---------------------------------------------------------------------------
+// Waveform capture trigger (native targets only).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+mod trigger_impl {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// One-shot signal from the UI/web layer to the ADC thread: "capture a
+    /// diagnostic waveform next time you get a chance". Cheap to clone; clones
+    /// share the same underlying flag.
+    ///
+    /// Kept separate from `StatusBroker` because the broker is a read-only
+    /// surface for status data — this is a control input.
+    #[derive(Clone, Default)]
+    pub struct WaveformTrigger {
+        flag: Arc<AtomicBool>,
+    }
+
+    impl WaveformTrigger {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Mark a capture as requested. Idempotent.
+        pub fn request(&self) {
+            self.flag.store(true, Ordering::Relaxed);
+        }
+
+        /// Non-destructively read the current request state.
+        pub fn is_requested(&self) -> bool {
+            self.flag.load(Ordering::Relaxed)
+        }
+
+        /// Atomically read-and-clear. Returns `true` exactly once per
+        /// `request()` call; used by the ADC thread to decide when to
+        /// switch into capture mode.
+        pub fn take(&self) -> bool {
+            self.flag.swap(false, Ordering::Relaxed)
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use trigger_impl::WaveformTrigger;
 
 #[cfg(test)]
 mod tests {
@@ -310,5 +416,65 @@ mod tests {
     #[test]
     fn test_status_reader_is_clone_send_sync() {
         assert_clone_send_sync::<StatusReader>();
+    }
+
+    // ----- Diagnostic waveform capture -----
+
+    fn fake_waveform(ts: u64) -> Waveform {
+        Waveform {
+            captured_at_unix_ms: ts,
+            window_count: 2,
+            window_ms: 20,
+            spi_hz: 300_000,
+            samples: vec![
+                WaveformSample { t_s: 0.0, amps: 0.0 },
+                WaveformSample { t_s: 0.01, amps: 1.5 },
+                WaveformSample { t_s: 0.02, amps: 0.0 },
+                WaveformSample { t_s: 0.2, amps: 0.0 },
+                WaveformSample { t_s: 0.21, amps: 1.5 },
+                WaveformSample { t_s: 0.22, amps: 0.0 },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_initial_status_has_no_waveform_timestamp() {
+        let broker = StatusBroker::new();
+        let snap = broker.reader().snapshot();
+        assert_eq!(snap.waveform_captured_at_unix_ms, None);
+        assert!(broker.reader().latest_waveform().is_none());
+    }
+
+    #[test]
+    fn test_waveform_round_trips_through_broker() {
+        let broker = StatusBroker::new();
+        let wf = fake_waveform(1700000000123);
+        broker.publish_waveform(wf.clone());
+
+        let got = broker.reader().latest_waveform().expect("waveform present");
+        assert_eq!(got.captured_at_unix_ms, wf.captured_at_unix_ms);
+        assert_eq!(got.window_count, 2);
+        assert_eq!(got.window_ms, 20);
+        assert_eq!(got.spi_hz, 300_000);
+        assert_eq!(got.samples.len(), 6);
+        assert_eq!(got.samples[1].amps, 1.5);
+    }
+
+    #[test]
+    fn test_waveform_publish_advances_status_timestamp() {
+        let broker = StatusBroker::new();
+        broker.publish_waveform(fake_waveform(1700000000123));
+        let snap = broker.reader().snapshot();
+        assert_eq!(snap.waveform_captured_at_unix_ms, Some(1700000000123));
+    }
+
+    #[test]
+    fn test_waveform_serde_round_trip() {
+        let wf = fake_waveform(1700000000456);
+        let json = serde_json::to_string(&wf).expect("serialize");
+        let parsed: Waveform = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.captured_at_unix_ms, wf.captured_at_unix_ms);
+        assert_eq!(parsed.samples.len(), wf.samples.len());
+        assert_eq!(parsed.samples[1].amps, wf.samples[1].amps);
     }
 }
