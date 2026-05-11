@@ -91,18 +91,16 @@ pub struct GpioPeripherals {
 }
 
 impl GpioPeripherals {
-    #[must_use]
-    pub fn new() -> Self {
-        // TODO: unwraps
-        let gpio = Gpio::new().unwrap();
+    pub fn new() -> Result<Self, PeripheralsError> {
+        let gpio = Gpio::new().change_context(PeripheralsError)?;
 
-        let pilot = Pilot::new().unwrap();
-        let mut power_watchdog_pin = gpio.get(POWER_WATCHDOG_PIN).unwrap().into_output();
-        let mut contactor_pin = gpio.get(CONTACTOR_PIN).unwrap().into_output();
-        let gfi_status_pin = gpio.get(GFI_STATUS_PIN).unwrap().into_input();
-        let relay_test_pin = gpio.get(RELAY_TEST_PIN).unwrap().into_input();
-        let mut gfi_test_pin = gpio.get(GFI_TEST_PIN).unwrap().into_output();
-        let mut gfi_reset_pin = gpio.get(GFI_RESET_PIN).unwrap().into_output();
+        let pilot = Pilot::new().change_context(PeripheralsError)?;
+        let mut power_watchdog_pin = gpio.get(POWER_WATCHDOG_PIN).change_context(PeripheralsError)?.into_output();
+        let mut contactor_pin = gpio.get(CONTACTOR_PIN).change_context(PeripheralsError)?.into_output();
+        let gfi_status_pin = gpio.get(GFI_STATUS_PIN).change_context(PeripheralsError)?.into_input();
+        let relay_test_pin = gpio.get(RELAY_TEST_PIN).change_context(PeripheralsError)?.into_input();
+        let mut gfi_test_pin = gpio.get(GFI_TEST_PIN).change_context(PeripheralsError)?.into_output();
+        let mut gfi_reset_pin = gpio.get(GFI_RESET_PIN).change_context(PeripheralsError)?.into_output();
 
         power_watchdog_pin.set_low();
         contactor_pin.set_low();
@@ -110,7 +108,9 @@ impl GpioPeripherals {
         gfi_reset_pin.set_low();
 
 
-        let adc = Arc::new(Mutex::new(Adc::new().unwrap()));
+        let adc = Arc::new(Mutex::new(
+            Adc::new().map_err(|e| Report::new(PeripheralsError).attach_printable(format!("ADC init failed: {:?}", e)))?
+        ));
 
         let pins = Arc::new(Mutex::new(Pins {
             contactor_pin: contactor_pin,
@@ -122,11 +122,11 @@ impl GpioPeripherals {
             power_watchdog_oscillating: false,
         }));
 
-        Self {
+        Ok(Self {
             adc: adc,
             pilot: pilot,
             pins: pins,
-        }
+        })
     }
 
     pub fn get_adc(&mut self) -> Arc<Mutex<Adc>> {
@@ -159,13 +159,14 @@ impl GpioPeripherals {
         self.pilot.set_to_waiting_for_vehicle().change_context(PeripheralsError)
     }
 
-    pub fn set_contactor_pin(&mut self, level: Level) {
-        let mut pins = self.pins.lock().unwrap();
+    pub fn set_contactor_pin(&mut self, level: Level) -> Result<(), PeripheralsError> {
+        let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
         pins.contactor_pin.write(level);
-            }
+        Ok(())
+    }
 
     pub fn reset_gfi_status_pin(&mut self) -> Result<(), PeripheralsError> {
-        let mut pins = self.pins.lock().unwrap();
+        let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
         pins.gfi_status_pin.clear_interrupt().change_context(PeripheralsError)?;
         pins.gfi_status_pin.clear_async_interrupt().change_context(PeripheralsError)?;
         match pins.gfi_status_pin.read() {
@@ -174,29 +175,32 @@ impl GpioPeripherals {
         }
     }
 
+    /// Mutex poisoning is recovered with `into_inner()` — the protected `Pins` is a
+    /// handle to hardware, not algorithmic state, so it's still usable after another
+    /// thread panicked while holding the lock.
     pub fn read_gfi_status_pin(&self) -> Level {
-        let pins = self.pins.lock().unwrap();
+        let pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
         pins.gfi_status_pin.read()
     }
 
     pub fn get_pins(&mut self) -> Arc<Mutex<Pins>> {
-        // TODO: Get rid of the unwrap
         Arc::clone(&self.pins)
     }
 
     pub fn read_relay_test_pin(&self) -> Level {
-        let pins = self.pins.lock().unwrap();
+        let pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
         pins.relay_test_pin.read()
     }
 
-    pub fn set_gfi_test_pin(&mut self, level: Level) {
-        let mut pins = self.pins.lock().unwrap();
+    pub fn set_gfi_test_pin(&mut self, level: Level) -> Result<(), PeripheralsError> {
+        let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
         pins.gfi_test_pin.write(level);
+        Ok(())
     }
 
     pub fn gfi_reset(&mut self) -> Result<(), PeripheralsError> {
         debug!("Resetting GFI");
-        let mut pins = self.pins.lock().unwrap();
+        let mut pins = self.pins.lock().map_err(|_| Report::new(PeripheralsError))?;
         pins.gfi_reset_pin.set_high();
         thread::sleep(std::time::Duration::from_millis(100));
         pins.gfi_reset_pin.set_low();
@@ -213,7 +217,7 @@ mod testgpio {
 
     use super::*;
     lazy_static! {
-        static ref GPIO: Mutex<GpioPeripherals> = Mutex::new(GpioPeripherals::new());
+        static ref GPIO: Mutex<GpioPeripherals> = Mutex::new(GpioPeripherals::new().unwrap());
     }
 
     #[test]

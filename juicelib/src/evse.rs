@@ -3,7 +3,6 @@
 
 // Define the state machine of an AC EVSE:
 
-use core::panic;
 use std::{thread, time::Duration, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, RwLock}};
 
 use rppal::gpio::{Level, Trigger};
@@ -187,13 +186,13 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
     let oper = sel.select();
     match oper.index() {
         0 => {
-            let voltage = oper.recv(&pilot_voltage_chan);
-            if let Err(_) = voltage {
-                return EVSEMachineInput::PilotInError;
+            match oper.recv(&pilot_voltage_chan) {
+                Ok(voltage) => {
+                    debug!("Pilot voltage: {:?}", voltage);
+                    get_pilot_state(voltage)
+                },
+                Err(_) => EVSEMachineInput::PilotInError,
             }
-            debug!("Pilot voltage: {:?}", voltage);
-            let voltage: (f32, f32) = voltage.unwrap();
-            get_pilot_state(voltage)
         },
         1 => {
             // Fault channel
@@ -213,9 +212,7 @@ fn get_new_state_input(pilot_voltage_chan: Receiver<(f32, f32)>, fault_channel: 
                 }
             }
         },
-        _ => {
-            panic!("Invalid index");
-        }
+        _ => unreachable!("Select returned an index outside 0..2"),
     }
 }
 
@@ -241,41 +238,70 @@ impl std::fmt::Display for HwError {
     }
 }
 
-fn start_adc_thread(periph: &mut GpioPeripherals, listen_to_pilot: Arc<AtomicBool>, sensors_state: Arc<RwLock<SensorsState>>) -> Result<Receiver<(f32, f32)>, HwError> {
+fn start_adc_thread(
+    periph: &mut GpioPeripherals,
+    listen_to_pilot: Arc<AtomicBool>,
+    sensors_state: Arc<RwLock<SensorsState>>,
+    fault_tx: crossbeam_channel::Sender<Fault>,
+) -> Result<Receiver<(f32, f32)>, HwError> {
     let (pilot_tx, pilot_rx) = bounded(16);
     let adc = periph.get_adc();
     thread::spawn(move || {
         loop {
             let (min, max, current, voltage);
             {
-                let locked_adc = adc.lock().unwrap();
-                (min, max) = locked_adc.peak_to_peak_pilot().unwrap();
-                current = locked_adc.read_current_sense_rms().unwrap();
-                voltage = locked_adc.peak_mains_voltage().unwrap();
+                let locked_adc = match adc.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("ADC mutex poisoned: {:?}", e);
+                        let _ = fault_tx.send(Fault::InternalFaultThreadError);
+                        break;
+                    }
+                };
+                match (
+                    locked_adc.peak_to_peak_pilot(),
+                    locked_adc.read_current_sense_rms(),
+                    locked_adc.peak_mains_voltage(),
+                ) {
+                    (Ok(p2p), Ok(cs), Ok(mv)) => {
+                        (min, max) = p2p;
+                        current = cs;
+                        voltage = mv;
+                    },
+                    (p2p, cs, mv) => {
+                        error!("ADC read failed: p2p={:?} cs={:?} mv={:?}", p2p.err(), cs.err(), mv.err());
+                        let _ = fault_tx.send(Fault::InternalFaultThreadError);
+                        break;
+                    }
+                }
             }
             thread::sleep(Duration::from_millis(200));
             if listen_to_pilot.load(Ordering::Relaxed) {
-                match pilot_tx.send((min, max)) {
-                    Err(_) => {
-                        error!("Pilot channel closed");
-                        break;
-                    },
-                    _ => {}
+                if let Err(_) = pilot_tx.send((min, max)) {
+                    error!("Pilot channel closed");
+                    break;
                 }
             }
-            {
-                let mut locked_sensors_state = sensors_state.write().unwrap();
-                locked_sensors_state.add_cs_reading(current as f64);
-                locked_sensors_state.add_mains_peak_reading(voltage as f64);
+            match sensors_state.write() {
+                Ok(mut locked_sensors_state) => {
+                    locked_sensors_state.add_cs_reading(current as f64);
+                    locked_sensors_state.add_mains_peak_reading(voltage as f64);
+                },
+                Err(e) => {
+                    error!("Sensors state RwLock poisoned: {:?}", e);
+                    let _ = fault_tx.send(Fault::InternalFaultThreadError);
+                    break;
+                }
             }
         }
     });
     Ok(pilot_rx)
 }
 
-fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, HwError> {
-    // TODO: This is wrong. fix to not lose the channel.
-    let (fault_tx, fault_rx) = bounded(16);
+fn start_fault_thread(
+    periph: &mut GpioPeripherals,
+    fault_tx: crossbeam_channel::Sender<Fault>,
+) -> Result<(), HwError> {
     let pins = periph.get_pins();
     
     thread::spawn(move || {
@@ -308,11 +334,13 @@ fn start_fault_thread(periph: &mut GpioPeripherals) -> Result<Receiver<Fault>, H
         }();
         if let Err(e) = res {
             error!("Error: {:?}", e);
-            fault_tx.send(Fault::InternalFaultThreadError).unwrap();
+            if let Err(send_err) = fault_tx.send(Fault::InternalFaultThreadError) {
+                error!("Failed to forward fault thread error (channel closed): {:?}", send_err);
+            }
         }
     });
-    
-    Ok(fault_rx)
+
+    Ok(())
 }
 
 
@@ -378,18 +406,17 @@ impl From<Level> for OnOff {
 }
 
 impl EVSEHardwareImpl {
-    pub fn new() -> Self {
-        // TODO: Remove the unwrap
+    pub fn new() -> Result<Self, HwError> {
         let mut ret = Self {
             contactor: OnOff::Off,
             current_offer: 0.0,
             ground_test_pin: OnOff::Off,
-            hw_peripherals: GpioPeripherals::new(),
+            hw_peripherals: GpioPeripherals::new().change_context(HwError::HardwareFault)?,
         };
-        ret.set_contactor(OnOff::Off).unwrap();
-        ret.set_current_offer_ampere(0.0).unwrap();
-        ret.set_ground_test_pin(OnOff::Off).unwrap();
-        ret
+        ret.set_contactor(OnOff::Off)?;
+        ret.set_current_offer_ampere(0.0)?;
+        ret.set_ground_test_pin(OnOff::Off)?;
+        Ok(ret)
     }
 }
 
@@ -406,7 +433,7 @@ impl EVSEHardware for EVSEHardwareImpl {
             self.hw_peripherals.set_oscillate_watchdog(oscillate).change_context(HwError::HardwareFault)
                     .attach_printable("Failed to set power watchdog to oscillate")?;
         }
-        self.hw_peripherals.set_contactor_pin(state.clone().into());
+        self.hw_peripherals.set_contactor_pin(state.clone().into()).change_context(HwError::HardwareFault)?;
         if !oscillate {
             debug!("Stopping power watchdog");
             self.hw_peripherals.set_oscillate_watchdog(oscillate).change_context(HwError::HardwareFault)
@@ -423,7 +450,7 @@ impl EVSEHardware for EVSEHardwareImpl {
 
     fn set_ground_test_pin(&mut self, state: OnOff) -> Result<(), HwError> {
         self.ground_test_pin = state.clone();
-        self.hw_peripherals.set_gfi_test_pin(state.into());
+        self.hw_peripherals.set_gfi_test_pin(state.into()).change_context(HwError::HardwareFault)?;
         Ok(())
     }
 
@@ -519,19 +546,21 @@ where T: EVSEHardware
     Ok(next_state_input)
 }
 
-pub fn start_machine<T>(mut evse: T) -> !
+pub fn start_machine<T>(mut evse: T) -> Result<(), HwError>
 where T: EVSEHardware + Send + Sync
 {
     let mut machine: StateMachine<EVSEMachine> = StateMachine::new();
     let liste_to_pilot = Arc::new(AtomicBool::new(false));
     let sensor_state = Arc::new(RwLock::new(SensorsState::new()));
 
+    let (fault_tx, fault_chan) = bounded::<Fault>(16);
     let pilot_voltage_chan = start_adc_thread(
         evse.get_peripherals(),
         Arc::clone(&liste_to_pilot),
-        Arc::clone(&sensor_state)
-    ).unwrap();
-    let fault_chan = start_fault_thread(evse.get_peripherals()).unwrap();
+        Arc::clone(&sensor_state),
+        fault_tx.clone(),
+    )?;
+    start_fault_thread(evse.get_peripherals(), fault_tx)?;
 
     loop {
         let mut state_input = EVSEMachineInput::PilotInError;
@@ -560,7 +589,18 @@ where T: EVSEHardware + Send + Sync
             },
             EVSEMachineState::FailedStation => {
                 error!("Station failed. Full reset required, contact admin if the issue persists.");
-                panic!("Fatal Error");
+                // Safe idle: hold the process alive instead of crashing into a 60 s
+                // systemd restart cycle. Contactor off, pilot to error (-12 V), watchdog off.
+                if let Err(e) = evse.set_contactor(OnOff::Off) {
+                    error!("FailedStation: failed to open contactor: {:?}", e);
+                }
+                if let Err(e) = evse.get_peripherals().set_pilot_ampere(0.0) {
+                    error!("FailedStation: failed to drive pilot to error: {:?}", e);
+                }
+                liste_to_pilot.store(false, Ordering::Relaxed);
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
             },
             state => {
                 // Measure pilot voltage and feed the machine
@@ -588,7 +628,9 @@ where T: EVSEHardware + Send + Sync
                         // This is anyway only a secondary safety measure, since the hardware is already hard-wired
                         // to turn off the contactor immediately if a something dangerous happens (no software), 
                         // such as GFI for example.
-                        evse.set_contactor(OnOff::Off).unwrap_or(());
+                        if let Err(e2) = evse.set_contactor(OnOff::Off) {
+                            error!("Failed to open contactor on fault path: {:?}", e2);
+                        }
                     },
                     Ok(ok) => {
                         match ok {
@@ -601,7 +643,9 @@ where T: EVSEHardware + Send + Sync
                         }
                     }
                 }
-                debug!("Current sensor state: {}", sensor_state.read().unwrap());
+                if let Ok(state) = sensor_state.read() {
+                    debug!("Current sensor state: {}", state);
+                }
             }
         }
         debug!("State input: {:?}", state_input);
